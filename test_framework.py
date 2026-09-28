@@ -176,6 +176,121 @@ class TestLLMFailover(unittest.TestCase):
                 self.assertIn("THINKING PROCESS", result)
 
 
+class TestHumanInTheLoop(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.bridge = LocalFileMemoryBridge(storage_dir=self.test_dir)
+        self.config = AgentConfig(agent_id="hitl_agent", max_steps_per_run=3)
+        self.agent = AutonomousAgent(config=self.config, memory_bridge=self.bridge)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_fsm_pending_approval_transitions(self):
+        # PLAN / EXECUTE may enter PENDING_APPROVAL
+        fsm = StateManager(AgentContext(run_id="r1"))
+        fsm.transition_to(AgentState.PLAN, reason="planning")
+        fsm.transition_to(AgentState.PENDING_APPROVAL, reason="external task detected")
+        self.assertEqual(fsm.current_state, AgentState.PENDING_APPROVAL)
+        # PENDING_APPROVAL may wind down to SLEEP
+        fsm.transition_to(AgentState.SLEEP, reason="await human")
+        self.assertEqual(fsm.current_state, AgentState.SLEEP)
+        # WAKE_UP may NOT jump directly into PENDING_APPROVAL
+        fsm2 = StateManager(AgentContext(run_id="r2"))
+        with self.assertRaises(StateTransitionError):
+            fsm2.transition_to(AgentState.PENDING_APPROVAL, reason="illegal jump")
+
+    def _seed_pending_state(self, decision, active_plan=None):
+        pending = {
+            "task_id": "abc123def456",
+            "type": "Freelance Pitch",
+            "target_platform": "Upwork",
+            "proposed_action": "Submit pitch",
+            "generated_files": [],
+            "estimated_revenue": "$120",
+        }
+        self.bridge.save_short_term_state(
+            "hitl_agent",
+            ShortTermState(
+                run_id="run_prev",
+                current_state=AgentState.PENDING_APPROVAL.value,
+                cycle_count=3,
+                active_plan=active_plan or [],
+                context_data={"pending_proposal": pending, "human_decision": decision},
+            ),
+        )
+
+    def test_null_decision_sleeps_without_executing(self):
+        self._seed_pending_state(decision=None)
+        self.agent.run_cycle()
+
+        persisted = self.bridge.load_short_term_state("hitl_agent")
+        self.assertIsNotNone(persisted)
+        self.assertEqual(persisted.current_state, AgentState.SLEEP.value)
+        # Proposal preserved and decision still null
+        self.assertIn("pending_proposal", persisted.context_data)
+        self.assertIsNone(persisted.context_data["human_decision"])
+        # No execution occurred
+        event_types = [l.event_type for l in self.bridge.retrieve_recent_logs("hitl_agent", limit=20)]
+        self.assertNotIn("ACTION", event_types)
+        self.assertIn("PENDING_APPROVAL", event_types)
+
+    def test_approved_decision_executes_and_clears_task(self):
+        self._seed_pending_state(
+            decision="APPROVED",
+            active_plan=["1. Package approved deliverable locally", "2. Write delivery summary"],
+        )
+        self.agent.run_cycle()
+
+        persisted = self.bridge.load_short_term_state("hitl_agent")
+        self.assertEqual(persisted.current_state, AgentState.SLEEP.value)
+        self.assertNotIn("pending_proposal", persisted.context_data)
+        self.assertNotIn("human_decision", persisted.context_data)
+
+        event_types = [l.event_type for l in self.bridge.retrieve_recent_logs("hitl_agent", limit=20)]
+        self.assertIn("APPROVED", event_types)
+        self.assertIn("ACTION", event_types)
+        # Approved steps actually ran
+        self.assertEqual(len(self.agent.state_manager.context.execution_results), 2)
+
+    def test_denied_decision_clears_task_and_replans(self):
+        self._seed_pending_state(
+            decision="DENIED",
+            active_plan=["1. Submit pitch to client"],
+        )
+        self.agent.run_cycle()
+
+        persisted = self.bridge.load_short_term_state("hitl_agent")
+        self.assertEqual(persisted.current_state, AgentState.SLEEP.value)
+        self.assertNotIn("pending_proposal", persisted.context_data)
+        self.assertNotIn("human_decision", persisted.context_data)
+
+        event_types = [l.event_type for l in self.bridge.retrieve_recent_logs("hitl_agent", limit=20)]
+        self.assertIn("DENIED", event_types)
+        # Returned to planning + execution after denial
+        self.assertIn("PLAN", event_types)
+        self.assertIn("ACTION", event_types)
+
+    def test_pending_proposal_structure(self):
+        self.agent.initialize_state()
+        proposal = self.agent._build_pending_proposal(
+            "Submit freelance pitch to Upwork requesting $250 payment milestone", "PLAN"
+        )
+        for key in ("task_id", "type", "target_platform", "proposed_action", "generated_files", "estimated_revenue"):
+            self.assertIn(key, proposal)
+        self.assertIsInstance(proposal["task_id"], str)
+        self.assertEqual(len(proposal["task_id"]), 12)
+        self.assertEqual(proposal["type"], "Freelance Pitch")
+        self.assertEqual(proposal["target_platform"], "Upwork")
+        self.assertIn("$250", proposal["estimated_revenue"])
+        self.assertIsInstance(proposal["generated_files"], list)
+
+    def test_approval_trigger_detection(self):
+        self.assertTrue(self.agent._requires_human_approval("Submit listing to marketplace and collect payment"))
+        self.assertTrue(self.agent._requires_human_approval("write human_action_needed.json for registration"))
+        self.assertFalse(self.agent._requires_human_approval("Inspect local workspace files and summarize logs"))
+
+
 class TestToolbox(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()

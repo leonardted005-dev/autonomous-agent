@@ -17,6 +17,7 @@ Core Responsibilities:
 
 from __future__ import annotations
 
+import hashlib
 import html as html_lib
 import json
 import logging
@@ -405,7 +406,7 @@ class LLMClient:
             "THINKING PROCESS:\n"
             "- Operating in autonomous exploration mode without live API key.\n"
             "- Reviewing long-term memory logs and local workspace environment.\n"
-            "- Selecting file_writer_tool to register an autonomous discovery log.\n"
+            "- Selecting file_writer_tool to record an autonomous discovery log.\n"
             "STEP-BY-STEP PLAN:\n"
             '1. TOOL_CALL: file_writer_tool {"filepath": "autonomous_discovery.txt", "content": "Discovery cycle initialized. Exploring opportunities."}\n'
             "2. Inspect and verify tool output status.\n"
@@ -433,14 +434,21 @@ class AutonomousAgent:
         self.llm = LLMClient(self.config)
         self.toolbox = toolbox or Toolbox()
         self.state_manager: Optional[StateManager] = None
+        # Human-in-the-loop gate bookkeeping (hydrated from persisted state)
+        self._resume_state: Optional[str] = None
+        self._human_decision: Optional[str] = None
 
     def initialize_state(self) -> None:
         """Hydrates previous context from memory bridge or starts fresh WAKE_UP context."""
         logger.info("Agent wake up initialized for Agent ID: '%s'", self.config.agent_id)
         saved_state = self.memory.load_short_term_state(self.config.agent_id)
+        self._resume_state = None
+        self._human_decision = None
 
         if saved_state:
             logger.info("Found existing state from previous run (cycle #%d)", saved_state.cycle_count)
+            self._resume_state = saved_state.current_state
+            self._human_decision = saved_state.context_data.get("human_decision")
             context = AgentContext(
                 run_id=f"run_{int(datetime.now(timezone.utc).timestamp())}",
                 cycle_count=saved_state.cycle_count + 1,
@@ -551,7 +559,151 @@ class AutonomousAgent:
 
         return result
 
+    # ------------------------------------------------------------------
+    # Human-in-the-Loop Dashboard Gateway helpers
+    # ------------------------------------------------------------------
 
+    # Signals that a task touches external platforms / money / publishing
+    APPROVAL_TRIGGER_PATTERNS = (
+        r"external platform", r"marketplace", r"payment", r"transaction", r"invoice",
+        r"account creation", r"create an account", r"sign ?up", r"registration",
+        r"register", r"publish", r"submit (?:a )?(?:proposal|listing|pitch)", r"\bpitch",
+        r"freelance", r"\bsell\b", r"checkout", r"payout", r"escrow", r"\bbid\b",
+        r"human_action_needed", r"human intervention", r"bank transfer", r"paypal",
+        r"upload (?:asset|listing)", r"post (?:a )?listing", r"financial transaction",
+    )
+
+    _KNOWN_PLATFORMS = (
+        "Fiverr", "Upwork", "Toptal", "Gumroad", "Etsy", "GitHub", "GitLab",
+        "LeetCode", "TaskRabbit", "Udemy", "Product Hunt", "Hacker News",
+        "Freelancer", "PeoplePerHour", "Contra", "Legiit", "Kwork", "Medium",
+        "Substack", "itch.io", "Stack Overflow", "CodeCanyon", "ThemeForest",
+    )
+
+    def _requires_human_approval(self, text: str) -> bool:
+        """Detects external-platform / financial / publishing intent in a plan step."""
+        if not text:
+            return False
+        low = text.lower()
+        if "human_action_needed" in low or "human intervention" in low:
+            return True
+        return any(re.search(pattern, low) for pattern in self.APPROVAL_TRIGGER_PATTERNS)
+
+    def _classify_proposal_type(self, text: str) -> str:
+        low = text.lower()
+        if re.search(r"freelance|pitch|bid on|client outreach|proposal to", low):
+            return "Freelance Pitch"
+        if re.search(r"asset|template|code sale|sell.{0,20}(code|script|plugin|theme)|gumroad|listing", low):
+            return "Code Asset Sale"
+        return "Trend Report"
+
+    def _extract_target_platform(self, text: str) -> str:
+        low = text.lower()
+        for platform in self._KNOWN_PLATFORMS:
+            if platform.lower() in low:
+                return platform
+        match = re.search(
+            r"(?:platform|marketplace|website|site|on)\s+(?:named\s+)?['\"]?"
+            r"([A-Z][A-Za-z0-9]{2,20}(?:\s[A-Z][A-Za-z0-9]{1,20})?)",
+            text,
+        )
+        return match.group(1) if match else "TBD"
+
+    def _extract_estimated_revenue(self, text: str) -> str:
+        match = re.search(r"(?:USD|EUR|GBP|\$|€|£)\s?\d[\d,]*(?:\.\d{1,2})?", text, re.I)
+        if match:
+            return match.group(0).strip()
+        match = re.search(r"\d[\d,]*(?:\.\d{1,2})?\s*(?:USD|EUR|GBP)", text, re.I)
+        if match:
+            return match.group(0).strip()
+        match = re.search(r"\d+\s*(?:per|/)\s*(?:hour|hr|month|mo|week|project|task|day)", text, re.I)
+        if match:
+            return match.group(0).strip()
+        return "TBD"
+
+    def _collect_generated_files(self) -> List[Dict[str, str]]:
+        """Collects files written via file_writer_tool during this execution block."""
+        files: List[Dict[str, str]] = []
+        seen = set()
+        if not self.state_manager:
+            return files
+        for res in self.state_manager.context.execution_results:
+            if res.get("tool_executed") != "file_writer_tool" or res.get("status") != "SUCCESS":
+                continue
+            args = res.get("tool_arguments") or {}
+            name = str(args.get("filepath", "unknown_file"))
+            if name in seen:
+                continue
+            seen.add(name)
+            files.append({"name": name, "content": str(args.get("content", ""))})
+        return files
+
+    def _build_pending_proposal(self, source_text: str, phase: str) -> Dict[str, Any]:
+        """Builds the structured pending_proposal JSON dictionary for the dashboard."""
+        stamp = datetime.now(timezone.utc).isoformat()
+        run_id = self.state_manager.context.run_id if self.state_manager else "unknown_run"
+        task_id = hashlib.sha1(f"{run_id}:{stamp}:{source_text[:80]}".encode("utf-8")).hexdigest()[:12]
+        return {
+            "task_id": task_id,
+            "type": self._classify_proposal_type(source_text),
+            "target_platform": self._extract_target_platform(source_text),
+            "proposed_action": source_text.strip(),
+            "generated_files": self._collect_generated_files(),
+            "estimated_revenue": self._extract_estimated_revenue(source_text),
+            "detected_in_phase": phase,
+            "created_at": stamp,
+        }
+
+    def _evaluate_human_gate(self) -> str:
+        """
+        Human-in-the-loop gate evaluated on wake.
+        Returns one of: NONE (no pending task), AWAITING (sleep until decision),
+        APPROVED (resume execution), DENIED (clear task and re-plan).
+        """
+        if not self.state_manager:
+            return "NONE"
+        ctx = self.state_manager.context
+        pending = ctx.payload.get("pending_proposal")
+        resumed_pending = self._resume_state == AgentState.PENDING_APPROVAL.value
+
+        if resumed_pending and not pending:
+            logger.warning("State was PENDING_APPROVAL but no pending_proposal found; resuming normal planning.")
+            return "NONE"
+        if not pending:
+            return "NONE"
+
+        decision = ctx.payload.get("human_decision")
+        if decision is None or str(decision).strip() == "":
+            return "AWAITING"
+        upper = str(decision).strip().upper()
+        if upper == "APPROVED":
+            return "APPROVED"
+        if upper == "DENIED":
+            return "DENIED"
+        logger.warning("Unknown human_decision '%s'; treating as awaiting approval.", decision)
+        return "AWAITING"
+
+    def _enter_pending_approval(self, source_text: str, phase: str) -> Dict[str, Any]:
+        """Formats and persists the pending_proposal, halting the cycle for human review."""
+        assert self.state_manager is not None
+        ctx = self.state_manager.context
+        proposal = self._build_pending_proposal(source_text, phase)
+        ctx.payload["pending_proposal"] = proposal
+        ctx.payload["human_decision"] = None
+
+        self.memory.append_long_term_log(
+            self.config.agent_id,
+            MemoryLogEntry(
+                entry_id=f"pending_{datetime.now(timezone.utc).timestamp()}",
+                event_type="PENDING_APPROVAL",
+                payload={"pending_proposal": proposal},
+            ),
+        )
+        logger.info(
+            "Task %s requires human approval (type=%s, platform=%s). Persisting pending_proposal.",
+            proposal["task_id"], proposal["type"], proposal["target_platform"],
+        )
+        return proposal
 
     def run_cycle(self) -> None:
         """
@@ -562,52 +714,136 @@ class AutonomousAgent:
         try:
             self.initialize_state()
             assert self.state_manager is not None
+            ctx = self.state_manager.context
+
+            # --- 0. Human-in-the-Loop gate on wake ---
+            gate = self._evaluate_human_gate()
+            approved_resume = False
+            if gate == "AWAITING":
+                logger.info("Pending proposal awaits human decision. Sleeping without execution.")
+                self.memory.append_long_term_log(
+                    self.config.agent_id,
+                    MemoryLogEntry(
+                        entry_id=f"await_{datetime.now(timezone.utc).timestamp()}",
+                        event_type="PENDING_APPROVAL",
+                        payload={
+                            "detail": "human_decision is null; sleeping until dashboard decision",
+                            "pending_proposal": ctx.payload.get("pending_proposal"),
+                        },
+                    ),
+                )
+                self.state_manager.transition_to(AgentState.SLEEP, reason="Awaiting human decision on pending proposal")
+                self.persist_current_state()
+                logger.info("Agent paused in SLEEP awaiting human approval.")
+                return
+
+            if gate == "DENIED":
+                cleared = ctx.payload.pop("pending_proposal", None)
+                ctx.payload.pop("human_decision", None)
+                task_ref = cleared.get("task_id") if isinstance(cleared, dict) else "unknown"
+                logger.info("Human DENIED pending task %s; clearing task and returning to planning.", task_ref)
+                self.memory.append_long_term_log(
+                    self.config.agent_id,
+                    MemoryLogEntry(
+                        entry_id=f"denied_{datetime.now(timezone.utc).timestamp()}",
+                        event_type="DENIED",
+                        payload={"cleared_task_id": task_ref},
+                    ),
+                )
+            elif gate == "APPROVED":
+                cleared = ctx.payload.pop("pending_proposal", None)
+                ctx.payload.pop("human_decision", None)
+                approved_resume = True
+                task_ref = cleared.get("task_id") if isinstance(cleared, dict) else "unknown"
+                logger.info("Human APPROVED pending task %s; proceeding to execution block.", task_ref)
+                self.memory.append_long_term_log(
+                    self.config.agent_id,
+                    MemoryLogEntry(
+                        entry_id=f"approved_{datetime.now(timezone.utc).timestamp()}",
+                        event_type="APPROVED",
+                        payload={"approved_task_id": task_ref},
+                    ),
+                )
 
             # --- 1. WAKE_UP -> PLAN ---
-            self.state_manager.transition_to(AgentState.PLAN, reason="Initial plan formulation")
-            recent_logs = self.memory.retrieve_recent_logs(self.config.agent_id, limit=5)
-            log_summaries = [l.to_dict() for l in recent_logs]
+            resume_reason = "Resuming human-approved task" if approved_resume and ctx.active_plan else "Initial plan formulation"
+            self.state_manager.transition_to(AgentState.PLAN, reason=resume_reason)
 
-            plan_prompt = (
-                f"Agent ID: {self.config.agent_id}\n"
-                f"Current Cycle: {self.state_manager.context.cycle_count}\n"
-                f"Recent Logs: {json.dumps(log_summaries)}\n"
-                "Task: Synthesize context and formulate an atomic operational plan."
-            )
-            monologue = self.generate_monologue(plan_prompt)
-            logger.info("Internal Monologue Generated:\n%s", monologue)
+            if approved_resume and ctx.active_plan:
+                monologue = "Resuming human-approved plan:\n" + "\n".join(ctx.active_plan)
+                logger.info("Skipping re-plan; executing human-approved active plan.")
+            else:
+                recent_logs = self.memory.retrieve_recent_logs(self.config.agent_id, limit=5)
+                log_summaries = [l.to_dict() for l in recent_logs]
+                plan_prompt = (
+                    f"Agent ID: {self.config.agent_id}\n"
+                    f"Current Cycle: {ctx.cycle_count}\n"
+                    f"Recent Logs: {json.dumps(log_summaries)}\n"
+                    "Task: Synthesize context and formulate an atomic operational plan."
+                )
+                monologue = self.generate_monologue(plan_prompt)
+                logger.info("Internal Monologue Generated:\n%s", monologue)
+                ctx.active_plan = [
+                    line.strip() for line in monologue.splitlines() if line.strip().startswith(("1.", "2.", "3."))
+                ]
 
-            self.state_manager.context.active_plan = [
-                line.strip() for line in monologue.splitlines() if line.strip().startswith(("1.", "2.", "3."))
-            ]
+                # PLAN-phase Human-in-the-Loop detection
+                if self._requires_human_approval(monologue):
+                    self._enter_pending_approval(monologue, "PLAN")
+                    self.state_manager.transition_to(
+                        AgentState.PENDING_APPROVAL,
+                        reason="Plan involves external platform, financial transaction, or asset publishing",
+                    )
+                    self.persist_current_state()
+                    logger.info("Cycle halted in PENDING_APPROVAL state awaiting dashboard review.")
+                    return
+
             self.memory.append_long_term_log(
                 self.config.agent_id,
                 MemoryLogEntry(
                     entry_id=f"plan_{datetime.now(timezone.utc).timestamp()}",
                     event_type="PLAN",
-                    payload={"monologue": monologue, "plan": self.state_manager.context.active_plan},
+                    payload={"monologue": monologue, "plan": ctx.active_plan},
                 ),
             )
 
             # --- 2. PLAN -> EXECUTE ---
             self.state_manager.transition_to(AgentState.EXECUTE, reason="Executing plan steps")
-            step_count = min(len(self.state_manager.context.active_plan), self.config.max_steps_per_run)
+            step_count = min(len(ctx.active_plan), self.config.max_steps_per_run)
             logger.info("Executing %d planned steps for this cycle...", step_count)
 
+            triggered_step: Optional[str] = None
             for idx in range(step_count):
-                step_desc = self.state_manager.context.active_plan[idx]
+                step_desc = ctx.active_plan[idx]
                 logger.info("Running Step [%d/%d]: %s", idx + 1, step_count, step_desc)
                 result = self._parse_and_execute_step(step_desc)
-                self.state_manager.context.execution_results.append(result)
+                ctx.execution_results.append(result)
+                if not approved_resume and triggered_step is None:
+                    wrote_human_file = str((result.get("tool_arguments") or {}).get("filepath", "")).endswith(
+                        "human_action_needed.json"
+                    )
+                    if self._requires_human_approval(step_desc) or wrote_human_file:
+                        triggered_step = step_desc
 
             self.memory.append_long_term_log(
                 self.config.agent_id,
                 MemoryLogEntry(
                     entry_id=f"exec_{datetime.now(timezone.utc).timestamp()}",
                     event_type="ACTION",
-                    payload={"results": self.state_manager.context.execution_results},
+                    payload={"results": ctx.execution_results},
                 ),
             )
+
+            # EXECUTE-phase Human-in-the-Loop detection
+            if triggered_step is not None:
+                self._enter_pending_approval(triggered_step, "EXECUTE")
+                self.state_manager.transition_to(
+                    AgentState.PENDING_APPROVAL,
+                    reason="Execution step involves external platform, financial transaction, or asset publishing",
+                )
+                self.persist_current_state()
+                logger.info("Cycle halted in PENDING_APPROVAL state awaiting dashboard review.")
+                return
 
             # --- 3. EXECUTE -> EVALUATE ---
             self.state_manager.transition_to(AgentState.EVALUATE, reason="Assessing run results")

@@ -5,7 +5,7 @@ Provides an explicit Finite State Machine (FSM) tailored for stateless cloud run
 such as GitHub Actions, AWS Lambda, or cron container workers.
 
 The agent transitions sequentially through lifecycle states:
-    WAKE_UP -> PLAN -> EXECUTE -> EVALUATE -> SLEEP (or ERROR)
+    WAKE_UP -> PLAN -> EXECUTE -> EVALUATE -> SLEEP (or ERROR / PENDING_APPROVAL)
 
 Each state change is validated against allowed transitions to prevent invalid execution paths
 and ensure complete determinism across ephemeral worker instances.
@@ -28,16 +28,20 @@ class AgentState(str, Enum):
     PLAN = "PLAN"
     EXECUTE = "EXECUTE"
     EVALUATE = "EVALUATE"
+    PENDING_APPROVAL = "PENDING_APPROVAL"
     SLEEP = "SLEEP"
     ERROR = "ERROR"
 
 
-# Strict map of allowed directional transitions between states
+# Strict map of allowed directional transitions between states.
+# PENDING_APPROVAL is entered from PLAN/EXECUTE when a task touches external
+# platforms, financial transactions, or asset publishing (Human-in-the-Loop gate).
 ALLOWED_TRANSITIONS: Dict[AgentState, List[AgentState]] = {
     AgentState.WAKE_UP: [AgentState.PLAN, AgentState.ERROR, AgentState.SLEEP],
-    AgentState.PLAN: [AgentState.EXECUTE, AgentState.EVALUATE, AgentState.ERROR, AgentState.SLEEP],
-    AgentState.EXECUTE: [AgentState.EVALUATE, AgentState.PLAN, AgentState.ERROR, AgentState.SLEEP],
+    AgentState.PLAN: [AgentState.EXECUTE, AgentState.EVALUATE, AgentState.PENDING_APPROVAL, AgentState.ERROR, AgentState.SLEEP],
+    AgentState.EXECUTE: [AgentState.EVALUATE, AgentState.PLAN, AgentState.PENDING_APPROVAL, AgentState.ERROR, AgentState.SLEEP],
     AgentState.EVALUATE: [AgentState.PLAN, AgentState.SLEEP, AgentState.ERROR],
+    AgentState.PENDING_APPROVAL: [AgentState.PLAN, AgentState.EXECUTE, AgentState.SLEEP, AgentState.ERROR, AgentState.WAKE_UP],
     AgentState.SLEEP: [AgentState.WAKE_UP],
     AgentState.ERROR: [AgentState.SLEEP],  # Graceful wind-down after failure logging
 }
