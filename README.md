@@ -72,6 +72,35 @@ When the agent detects a task that touches external platforms, money movement, o
    - `"DENIED"` $\rightarrow$ clears the task and returns to planning.
 4. To decide, edit your Gist state JSON and set `human_decision` inside `context_data` to `APPROVED` or `DENIED`.
 
+## Human-in-the-Loop Dashboard (Vercel)
+
+The gateway UI lives in a single self-contained file: **`index.html`** (Tailwind CSS via CDN + vanilla JS, zero build step).
+
+### Features
+- **Command center UI** — dark responsive layout with an active agent connection card, a live lifecycle tracker (`WAKE_UP → PLAN → EXECUTE → PENDING_APPROVAL → EVALUATE → SLEEP`), and a metrics panel (Cycle Count, Est. Revenue, Task Type, Target Platform).
+- **Lockable credentials panel** — `GIST_ID`, `GIT_TOKEN`, and optional `AGENT_ID` are stored exclusively in the browser's `localStorage` (never sent anywhere except `api.github.com`).
+- **Proposal render engine** — uses the GitHub Gists REST API (`GET /gists/{id}`, `PATCH /gists/{id}`) with `async/await`; when the agent state is `PENDING_APPROVAL` a prominent alert card shows Task ID, platform, proposed action, generated-file code previews, and expected revenue.
+- **1-button controls** — `🟢 APPROVE TASK` / `🔴 DENY TASK` patch `context_data.human_decision` (`APPROVED` / `DENIED`) in the Gist and confirm that the cloud runner will act on the next 30-minute cron cycle.
+
+### Deploy to Vercel (free)
+```bash
+# Option A — Vercel CLI
+npm i -g vercel
+vercel            # framework preset: "Other" · output directory: ./
+vercel --prod
+
+# Option B — GitHub import
+# Vercel Dashboard → Add New… → Project → Import the repo → Deploy
+# (static site: no build command, no output directory needed)
+```
+
+Open the deployed URL, click **Settings**, paste your `GIST_ID` and a GitHub token with `gist` scope, then press **Save Credentials**. The dashboard polls the Gist every 60 seconds.
+
+### Dashboard regression test
+```bash
+node dashboard_smoke_test.js   # 15/15 checks: render + APPROVE patch flow (uses a stubbed Gist)
+```
+
 ## Running the Agent
 
 ```bash

@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Autonomous Agent · Human-in-the-Loop Gateway</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      fontFamily: { sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'] },
+      keyframes: {
+        popIn: { '0%': { transform: 'scale(.96)', opacity: '0' }, '100%': { transform: 'scale(1)', opacity: '1' } },
+        slideUp: { '0%': { transform: 'translateY(14px)', opacity: '0' }, '100%': { transform: 'translateY(0)', opacity: '1' } },
+        blink: { '0%,100%': { opacity: '1' }, '50%': { opacity: '.35' } }
+      },
+      animation: {
+        popIn: 'popIn .35s ease-out both',
+        slideUp: 'slideUp .4s ease-out both',
+        blink: 'blink 1.6s ease-in-out infinite'
+      }
+    }
+  }
+};
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+<style>
+  body { font-family: 'Inter', sans-serif; }
+  .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-track { background: #0f172a; }
+  ::-webkit-scrollbar-thumb { background: #334155; border-radius: 6px; }
+  .glass { background: rgba(15, 23, 42, 0.72); backdrop-filter: blur(10px); }
+</style>
+</head>
+<body class="bg-slate-950 text-slate-200 min-h-screen selection:bg-emerald-500/30">
+
+<!-- ================= HEADER ================= -->
+<header class="sticky top-0 z-40 border-b border-slate-800 glass">
+  <div class="mx-auto max-w-7xl px-4 py-3 flex items-center justify-between gap-3">
+    <div class="flex items-center gap-3 min-w-0">
+      <div class="h-10 w-10 shrink-0 rounded-xl bg-emerald-500/15 border border-emerald-500/40 flex items-center justify-center text-lg">🤖</div>
+      <div class="min-w-0">
+        <h1 class="font-bold text-white text-lg leading-tight truncate">Human-in-the-Loop Gateway</h1>
+        <p class="text-[11px] text-slate-400 truncate">Autonomous Agent Command Center · Vercel Edge</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      <span id="connBadge" class="hidden sm:inline-flex items-center gap-1.5 rounded-full border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-400">
+        <span class="h-2 w-2 rounded-full bg-slate-500"></span> Offline
+      </span>
+      <button id="settingsBtn" title="Credentials" class="flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm font-medium text-slate-300 hover:border-slate-500 hover:text-white transition">
+        <span id="lockIcon">🔒</span> Settings
+      </button>
+    </div>
+  </div>
+
+  <!-- ============ LOCKABLE CREDENTIALS PANEL ============ -->
+  <div id="settingsPanel" class="hidden border-t border-slate-800 bg-slate-900/95">
+    <div class="mx-auto max-w-7xl px-4 py-5">
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h2 class="text-sm font-semibold text-white">🔐 Credentials Panel</h2>
+          <p class="text-xs text-slate-400">Stored 100% client-side in this browser's localStorage · never transmitted anywhere except GitHub's API.</p>
+        </div>
+        <span class="text-[11px] rounded-md bg-amber-500/10 border border-amber-500/30 px-2 py-1 text-amber-400">🔒 Local only</span>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div>
+          <label class="block text-xs font-medium text-slate-400 mb-1">GIST_ID <span class="text-slate-600">(memory Gist)</span></label>
+          <input id="inputGistId" type="text" placeholder="e.g. a1b2c3d4e5f6..." autocomplete="off"
+            class="mono w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 placeholder-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500/40" />
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-400 mb-1">GIT_TOKEN <span class="text-slate-600">(PAT with gist scope)</span></label>
+          <div class="relative">
+            <input id="inputGitToken" type="password" placeholder="github_pat_..." autocomplete="off"
+              class="mono w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 pr-10 text-sm text-slate-200 placeholder-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500/40" />
+            <button id="toggleToken" type="button" class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 text-xs">👁</button>
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-400 mb-1">AGENT_ID <span class="text-slate-600">(optional)</span></label>
+          <input id="inputAgentId" type="text" placeholder="default_stateless_agent" autocomplete="off"
+            class="mono w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 placeholder-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500/40" />
+        </div>
+      </div>
+      <div class="mt-4 flex flex-wrap items-center gap-3">
+        <button id="saveSettings" class="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 transition">💾 Save Credentials</button>
+        <button id="clearSettings" class="rounded-lg border border-slate-700 px-4 py-2 text-sm font-medium text-slate-300 hover:border-red-500/60 hover:text-red-400 transition">🗑 Clear Local Data</button>
+        <span id="settingsStatus" class="text-xs text-slate-500"></span>
+      </div>
+    </div>
+  </div>
+</header>
+<!-- ================= MAIN ================= -->
+<main class="mx-auto max-w-7xl px-4 py-6 space-y-6">
+
+  <!-- Row 1: Connection card + Status tracker -->
+  <section class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <!-- Agent connection card -->
+    <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 flex flex-col justify-between">
+      <div>
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-semibold uppercase tracking-widest text-slate-500">Active Agent</span>
+          <span id="agentStatusDot" class="h-2.5 w-2.5 rounded-full bg-slate-600 animate-blink"></span>
+        </div>
+        <p id="agentIdDisplay" class="mono mt-3 text-base font-semibold text-white break-all">default_stateless_agent</p>
+        <p id="agentConnDetail" class="mt-1 text-xs text-slate-400">Not configured — open Settings to connect.</p>
+      </div>
+      <div class="mt-5 flex items-center justify-between gap-2">
+        <div class="text-[11px] text-slate-500">
+          <p>Last sync: <span id="lastSync" class="text-slate-400 mono">—</span></p>
+          <p>Auto-refresh: <span class="text-slate-400">60s</span> · Cron: <span class="text-slate-400">30 min</span></p>
+        </div>
+        <button id="refreshBtn" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs font-medium text-slate-300 hover:border-emerald-500/60 hover:text-emerald-400 transition">⟳ Refresh</button>
+      </div>
+    </div>
+
+    <!-- Real-time status tracker -->
+    <div class="lg:col-span-2 rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
+      <div class="flex items-center justify-between mb-4">
+        <span class="text-xs font-semibold uppercase tracking-widest text-slate-500">Lifecycle Status Tracker</span>
+        <span id="stateBadge" class="rounded-full border border-slate-700 bg-slate-950 px-3 py-1 text-[11px] font-bold tracking-wide text-slate-400">UNKNOWN</span>
+      </div>
+      <ol id="tracker" class="flex flex-wrap items-center gap-y-3"></ol>
+      <p id="stateReason" class="mt-4 text-xs text-slate-500">Awaiting first sync…</p>
+    </div>
+  </section>
+
+  <!-- Row 2: Metrics -->
+  <section class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+      <p class="text-[11px] font-semibold uppercase tracking-widest text-slate-500">Cycle Count</p>
+      <p id="metricCycles" class="mono mt-1 text-2xl font-bold text-white">—</p>
+    </div>
+    <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+      <p class="text-[11px] font-semibold uppercase tracking-widest text-slate-500">Est. Revenue</p>
+      <p id="metricRevenue" class="mono mt-1 text-2xl font-bold text-emerald-400">—</p>
+    </div>
+    <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+      <p class="text-[11px] font-semibold uppercase tracking-widest text-slate-500">Task Type</p>
+      <p id="metricType" class="mt-1 text-lg font-semibold text-sky-400 truncate">—</p>
+    </div>
+    <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+      <p class="text-[11px] font-semibold uppercase tracking-widest text-slate-500">Target Platform</p>
+      <p id="metricPlatform" class="mt-1 text-lg font-semibold text-violet-400 truncate">—</p>
+    </div>
+  </section>
+  <!-- Row 3: Proposal alert card -->
+  <section id="proposalCard" class="hidden rounded-2xl border-2 border-amber-500/50 bg-amber-500/[0.06] p-5 md:p-6 animate-popIn">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div class="flex items-start gap-3">
+        <span class="text-2xl">⚠️</span>
+        <div>
+          <h2 class="text-lg font-bold text-amber-300">Task Awaiting Your Approval</h2>
+          <p class="text-xs text-amber-200/60">The cloud runner is paused in <span class="mono font-semibold">PENDING_APPROVAL</span> until you decide.</p>
+        </div>
+      </div>
+      <span id="proposalTaskId" class="mono rounded-lg border border-amber-500/40 bg-slate-950 px-3 py-1.5 text-xs text-amber-300">—</span>
+    </div>
+
+    <div class="mt-5 grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+        <p class="text-[11px] uppercase tracking-widest text-slate-500">Platform</p>
+        <p id="proposalPlatform" class="mt-1 text-base font-semibold text-white">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+        <p class="text-[11px] uppercase tracking-widest text-slate-500">Type</p>
+        <p id="proposalType" class="mt-1 text-base font-semibold text-white">—</p>
+      </div>
+      <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+        <p class="text-[11px] uppercase tracking-widest text-slate-500">Expected Revenue</p>
+        <p id="proposalRevenue" class="mono mt-1 text-base font-semibold text-emerald-400">—</p>
+      </div>
+    </div>
+
+    <div class="mt-4 rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+      <p class="text-[11px] uppercase tracking-widest text-slate-500 mb-1">Proposed Action</p>
+      <p id="proposalAction" class="text-sm leading-relaxed text-slate-300 whitespace-pre-wrap">—</p>
+    </div>
+
+    <div class="mt-4">
+      <p class="text-[11px] uppercase tracking-widest text-slate-500 mb-2">Generated Code / Files Preview</p>
+      <div id="proposalFiles" class="space-y-3"></div>
+    </div>
+
+    <div id="decisionArea" class="mt-6 flex flex-col sm:flex-row gap-3">
+      <button id="approveBtn" class="flex-1 rounded-xl bg-emerald-500 px-6 py-4 text-base font-bold text-slate-950 shadow-lg shadow-emerald-500/25 hover:bg-emerald-400 active:scale-[.98] transition">🟢 APPROVE TASK</button>
+      <button id="denyBtn" class="flex-1 rounded-xl bg-red-500 px-6 py-4 text-base font-bold text-white shadow-lg shadow-red-500/25 hover:bg-red-400 active:scale-[.98] transition">🔴 DENY TASK</button>
+    </div>
+    <div id="decisionSuccess" class="hidden mt-6 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-4 animate-slideUp">
+      <p id="decisionSuccessText" class="text-sm font-semibold text-emerald-300"></p>
+    </div>
+  </section>
+
+  <!-- Empty state -->
+  <section id="emptyState" class="rounded-2xl border border-dashed border-slate-800 bg-slate-900/40 p-8 text-center">
+    <p class="text-3xl">🛰️</p>
+    <h2 class="mt-2 font-semibold text-slate-300">No active proposal</h2>
+    <p class="mt-1 text-sm text-slate-500">The agent is running autonomously. A proposal card will appear here the moment it enters <span class="mono text-amber-400">PENDING_APPROVAL</span>.</p>
+  </section>
+</main>
+
+<!-- Toast -->
+<div id="toast" class="fixed bottom-5 right-5 z-50 hidden max-w-sm rounded-xl border px-4 py-3 text-sm font-medium shadow-2xl animate-slideUp"></div>
+
+<footer class="border-t border-slate-800 py-5 text-center text-[11px] text-slate-600">
+  Autonomous Agent · Human-in-the-Loop Gateway · credentials stored only in your browser's localStorage
+</footer>
+<script>
+/* =====================================================================
+   Human-in-the-Loop Gateway · vanilla JS proposal render engine
+   GitHub REST API (Gists) · async/await · zero external dependencies
+   ===================================================================== */
+"use strict";
+
+/* ---------- localStorage credentials (100% client-side) ---------- */
+const KEYS = { gist: "hitl_gist_id", token: "hitl_git_token", agent: "hitl_agent_id" };
+const LS = {
+  get: (k, d = "") => localStorage.getItem(k) ?? d,
+  set: (k, v) => localStorage.setItem(k, v),
+  del: (k) => localStorage.removeItem(k),
+};
+function getConfig() {
+  return {
+    gistId: LS.get(KEYS.gist).trim(),
+    token: LS.get(KEYS.token).trim(),
+    agentId: LS.get(KEYS.agent).trim() || "default_stateless_agent",
+  };
+}
+function stateFileName(agentId) {
+  return agentId.replace(/[^A-Za-z0-9_-]/g, "") + "_state.json";
+}
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+let toastTimer = null;
+function showToast(kind, message) {
+  const el = document.getElementById("toast");
+  const palette = kind === "error"
+    ? "border-red-500/50 bg-red-950/95 text-red-200"
+    : kind === "success"
+    ? "border-emerald-500/50 bg-emerald-950/95 text-emerald-200"
+    : "border-sky-500/50 bg-sky-950/95 text-sky-200";
+  el.className = `fixed bottom-5 right-5 z-50 max-w-sm rounded-xl border px-4 py-3 text-sm font-medium shadow-2xl animate-slideUp ${palette}`;
+  el.textContent = message;
+  el.classList.remove("hidden");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add("hidden"), 5000);
+}
+
+/* ---------- Lockable settings dropdown ---------- */
+const settingsBtn = document.getElementById("settingsBtn");
+const settingsPanel = document.getElementById("settingsPanel");
+const lockIcon = document.getElementById("lockIcon");
+settingsBtn.addEventListener("click", () => {
+  const open = settingsPanel.classList.toggle("hidden");
+  lockIcon.textContent = open ? "🔒" : "🔓";
+});
+document.getElementById("toggleToken").addEventListener("click", () => {
+  const input = document.getElementById("inputGitToken");
+  input.type = input.type === "password" ? "text" : "password";
+});
+function hydrateSettings() {
+  const cfg = getConfig();
+  document.getElementById("inputGistId").value = cfg.gistId;
+  document.getElementById("inputGitToken").value = cfg.token;
+  document.getElementById("inputAgentId").value = cfg.agentId === "default_stateless_agent" ? "" : cfg.agentId;
+  document.getElementById("agentIdDisplay").textContent = cfg.agentId;
+}
+document.getElementById("saveSettings").addEventListener("click", () => {
+  LS.set(KEYS.gist, document.getElementById("inputGistId").value.trim());
+  LS.set(KEYS.token, document.getElementById("inputGitToken").value.trim());
+  LS.set(KEYS.agent, document.getElementById("inputAgentId").value.trim() || "default_stateless_agent");
+  document.getElementById("settingsStatus").textContent = "Saved to localStorage ✔";
+  showToast("success", "Credentials saved locally in this browser.");
+  hydrateSettings();
+  refresh();
+});
+document.getElementById("clearSettings").addEventListener("click", () => {
+  Object.values(KEYS).forEach(LS.del);
+  document.getElementById("settingsStatus").textContent = "Local data cleared.";
+  hydrateSettings();
+  setConnection("offline", "Not configured — open Settings to connect.");
+  showToast("info", "Local credentials cleared.");
+});
+
+/* ---------- GitHub REST API client ---------- */
+const GitHubAPI = {
+  headers(token) {
+    return {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+    };
+  },
+  async fetchGist(gistId, token) {
+    const res = await fetch(`https://api.github.com/gists/${encodeURIComponent(gistId)}`, {
+      headers: this.headers(token),
+    });
+    if (!res.ok) throw new Error(`GitHub API ${res.status} — ${res.statusText}${res.status === 401 ? " (check GIT_TOKEN)" : res.status === 404 ? " (check GIST_ID)" : ""}`);
+    return res.json();
+  },
+  async fetchRaw(rawUrl, token) {
+    const res = await fetch(rawUrl, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) throw new Error(`Raw fetch failed (${res.status})`);
+    return res.text();
+  },
+  async patchGistFile(gistId, token, filename, content) {
+    const res = await fetch(`https://api.github.com/gists/${encodeURIComponent(gistId)}`, {
+      method: "PATCH",
+      headers: { ...this.headers(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ files: { [filename]: { content } } }),
+    });
+    if (!res.ok) throw new Error(`GitHub PATCH ${res.status} — ${res.statusText}`);
+    return res.json();
+  },
+};
+/* ---------- Connection status card ---------- */
+function setConnection(mode, detail) {
+  const badge = document.getElementById("connBadge");
+  const dot = document.getElementById("agentStatusDot");
+  const map = {
+    online: ["border-emerald-500/40 text-emerald-400 bg-emerald-500/10", "Connected", "bg-emerald-500"],
+    loading: ["border-sky-500/40 text-sky-400 bg-sky-500/10", "Syncing…", "bg-sky-400"],
+    error: ["border-red-500/40 text-red-400 bg-red-500/10", "Error", "bg-red-500"],
+    offline: ["border-slate-700 text-slate-400 bg-slate-900", "Offline", "bg-slate-500"],
+  };
+  const [cls, label, dotCls] = map[mode] || map.offline;
+  badge.className = `hidden sm:inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium ${cls}`;
+  badge.innerHTML = `<span class="h-2 w-2 rounded-full ${dotCls}"></span> ${label}`;
+  dot.className = `h-2.5 w-2.5 rounded-full animate-blink ${dotCls}`;
+  document.getElementById("agentConnDetail").textContent = detail;
+}
+
+/* ---------- Real-time status tracker ---------- */
+const TRACK = ["WAKE_UP", "PLAN", "EXECUTE", "PENDING_APPROVAL", "EVALUATE", "SLEEP"];
+function badgeClassFor(stateName) {
+  if (stateName === "PENDING_APPROVAL") return "border-amber-500/50 bg-amber-500/10 text-amber-300";
+  if (stateName === "ERROR") return "border-red-500/50 bg-red-500/10 text-red-300";
+  if (stateName === "SLEEP") return "border-indigo-500/50 bg-indigo-500/10 text-indigo-300";
+  if (stateName === "EXECUTE" || stateName === "PLAN") return "border-sky-500/50 bg-sky-500/10 text-sky-300";
+  return "border-emerald-500/50 bg-emerald-500/10 text-emerald-300";
+}
+function renderTracker(stateName) {
+  const tracker = document.getElementById("tracker");
+  tracker.innerHTML = "";
+  const steps = TRACK.slice();
+  if (stateName === "ERROR") steps.push("ERROR");
+  steps.forEach((name, i) => {
+    const active = name === stateName;
+    const short = name === "WAKE_UP" ? "WAKE" : name === "PENDING_APPROVAL" ? "PENDING" : name;
+    const chipCls = active
+      ? name === "PENDING_APPROVAL"
+        ? "bg-amber-400 text-slate-950 border-amber-300 shadow-lg shadow-amber-500/30"
+        : name === "ERROR"
+        ? "bg-red-500 text-white border-red-400 shadow-lg shadow-red-500/30"
+        : "bg-emerald-500 text-slate-950 border-emerald-400 shadow-lg shadow-emerald-500/30"
+      : "bg-slate-900 text-slate-500 border-slate-700";
+    const li = document.createElement("li");
+    li.className = "flex items-center";
+    li.innerHTML =
+      `<span class="mono rounded-lg border px-2.5 py-1.5 text-[11px] font-semibold tracking-wide transition ${chipCls}">${short}</span>` +
+      (i < steps.length - 1 ? `<span class="mx-1.5 text-slate-700 text-xs">→</span>` : "");
+    tracker.appendChild(li);
+  });
+  const badge = document.getElementById("stateBadge");
+  badge.textContent = stateName || "UNKNOWN";
+  badge.className = `rounded-full border px-3 py-1 text-[11px] font-bold tracking-wide ${badgeClassFor(stateName)}`;
+}
+/* ---------- Proposal render engine ---------- */
+let currentStateDoc = null;
+function renderProposal(proposal, decision) {
+  document.getElementById("proposalTaskId").textContent = proposal.task_id || "—";
+  document.getElementById("proposalPlatform").textContent = proposal.target_platform || "TBD";
+  document.getElementById("proposalType").textContent = proposal.type || "—";
+  document.getElementById("proposalRevenue").textContent = proposal.estimated_revenue || "TBD";
+  document.getElementById("proposalAction").textContent = proposal.proposed_action || "—";
+
+  const filesBox = document.getElementById("proposalFiles");
+  filesBox.innerHTML = "";
+  const files = Array.isArray(proposal.generated_files) ? proposal.generated_files : [];
+  if (!files.length) {
+    filesBox.innerHTML = `<p class="text-xs text-slate-600">No files generated for this task yet.</p>`;
+  } else {
+    files.slice(0, 5).forEach((f) => {
+      const full = String(f.content ?? "");
+      const code = full.length > 1500 ? full.slice(0, 1500) + "\n… (truncated)" : full;
+      const box = document.createElement("div");
+      box.className = "rounded-xl border border-slate-800 bg-slate-950 overflow-hidden animate-slideUp";
+      box.innerHTML =
+        `<div class="flex items-center justify-between border-b border-slate-800 px-3 py-2">
+           <span class="mono text-xs text-sky-300">${esc(f.name)}</span>
+           <span class="text-[10px] text-slate-600 mono">${full.length} bytes</span>
+         </div>
+         <pre class="mono overflow-x-auto p-3 text-[11px] leading-relaxed text-slate-400 max-h-48 whitespace-pre-wrap break-all">${esc(code)}</pre>`;
+      filesBox.appendChild(box);
+    });
+  }
+
+  const area = document.getElementById("decisionArea");
+  const success = document.getElementById("decisionSuccess");
+  const successText = document.getElementById("decisionSuccessText");
+  const decideBtns = [document.getElementById("approveBtn"), document.getElementById("denyBtn")];
+  decideBtns.forEach((b) => (b.disabled = false));
+  document.getElementById("approveBtn").innerHTML = "🟢 APPROVE TASK";
+  document.getElementById("denyBtn").innerHTML = "🔴 DENY TASK";
+
+  if (decision) {
+    area.classList.add("hidden");
+    successText.textContent =
+      decision === "APPROVED"
+        ? "✅ APPROVED — the cloud runner will execute this task on the next 30-minute cron cycle."
+        : "🚫 DENIED — the task will be cleared and the agent will return to planning on its next wake-up.";
+    success.classList.remove("hidden");
+  } else {
+    success.classList.add("hidden");
+    area.classList.remove("hidden");
+  }
+}
+
+function renderState(state) {
+  const ctx = state.context_data || {};
+  const proposal = ctx.pending_proposal || null;
+  const pending = state.current_state === "PENDING_APPROVAL" && proposal;
+
+  renderTracker(state.current_state);
+  document.getElementById("metricCycles").textContent = state.cycle_count ?? "—";
+  document.getElementById("metricRevenue").textContent = pending ? (proposal.estimated_revenue || "TBD") : "—";
+  document.getElementById("metricType").textContent = pending ? (proposal.type || "—") : "—";
+  document.getElementById("metricPlatform").textContent = pending ? (proposal.target_platform || "—") : "—";
+  document.getElementById("stateReason").textContent =
+    `Updated ${state.last_updated || "—"} · run ${state.run_id || "—"}`;
+
+  const card = document.getElementById("proposalCard");
+  const empty = document.getElementById("emptyState");
+  if (pending) {
+    renderProposal(proposal, ctx.human_decision || null);
+    card.classList.remove("hidden");
+    empty.classList.add("hidden");
+  } else {
+    card.classList.add("hidden");
+    empty.classList.remove("hidden");
+  }
+}
+/* ---------- Fetch state from GitHub Gist (async/await) ---------- */
+async function refresh() {
+  const cfg = getConfig();
+  document.getElementById("agentIdDisplay").textContent = cfg.agentId;
+  if (!cfg.gistId || !cfg.token) {
+    currentStateDoc = null;
+    setConnection("offline", "Not configured — open Settings to connect.");
+    return;
+  }
+  setConnection("loading", "Syncing with GitHub Gist…");
+  try {
+    const gist = await GitHubAPI.fetchGist(cfg.gistId, cfg.token);
+    const file = gist.files ? gist.files[stateFileName(cfg.agentId)] : null;
+    if (!file) {
+      throw new Error(`State file '${stateFileName(cfg.agentId)}' not found in Gist — check AGENT_ID.`);
+    }
+    let content = file.content || "";
+    if (file.truncated && file.raw_url) {
+      try {
+        content = await GitHubAPI.fetchRaw(file.raw_url, cfg.token);
+      } catch (_) {
+        showToast("info", "State file truncated — using partial preview.");
+      }
+    }
+    currentStateDoc = JSON.parse(content);
+    renderState(currentStateDoc);
+    const t = new Date().toLocaleTimeString();
+    document.getElementById("lastSync").textContent = t;
+    setConnection("online", `Synced with Gist at ${t}`);
+  } catch (e) {
+    currentStateDoc = null;
+    setConnection("error", e.message);
+    showToast("error", e.message);
+  }
+}
+
+/* ---------- 1-Button Controls: APPROVE / DENY ---------- */
+async function decide(decision) {
+  const cfg = getConfig();
+  if (!cfg.gistId || !cfg.token) {
+    showToast("error", "Configure GIST_ID and GIT_TOKEN in Settings first.");
+    return;
+  }
+  if (!currentStateDoc) {
+    showToast("error", "No state loaded — refresh first.");
+    return;
+  }
+  const approveBtn = document.getElementById("approveBtn");
+  const denyBtn = document.getElementById("denyBtn");
+  approveBtn.disabled = true;
+  denyBtn.disabled = true;
+  approveBtn.innerHTML = "⏳ Saving…";
+  denyBtn.innerHTML = "⏳ Saving…";
+  try {
+    const updated = JSON.parse(JSON.stringify(currentStateDoc));
+    updated.context_data = updated.context_data || {};
+    updated.context_data.human_decision = decision;
+    updated.last_updated = new Date().toISOString();
+    const filename = stateFileName(cfg.agentId);
+    await GitHubAPI.patchGistFile(cfg.gistId, cfg.token, filename, JSON.stringify(updated, null, 2));
+    currentStateDoc = updated;
+    renderState(updated);
+    showToast(
+      "success",
+      decision === "APPROVED"
+        ? "✅ Approved! Cloud runner will execute on the next 30-minute cron cycle."
+        : "🚫 Denied. Task will be cleared on the agent's next wake-up."
+    );
+  } catch (e) {
+    approveBtn.disabled = false;
+    denyBtn.disabled = false;
+    approveBtn.innerHTML = "🟢 APPROVE TASK";
+    denyBtn.innerHTML = "🔴 DENY TASK";
+    showToast("error", `Decision failed: ${e.message}`);
+  }
+}
+
+/* ---------- Wiring & boot ---------- */
+document.getElementById("refreshBtn").addEventListener("click", refresh);
+document.getElementById("approveBtn").addEventListener("click", () => decide("APPROVED"));
+document.getElementById("denyBtn").addEventListener("click", () => decide("DENIED"));
+
+hydrateSettings();
+renderTracker(null);
+setConnection("offline", "Not configured — open Settings to connect.");
+refresh();
+setInterval(refresh, 60000); // real-time poll every 60s
+
+
+
+</script>
+
+
+
+</body>
+</html>
