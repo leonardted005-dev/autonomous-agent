@@ -1,0 +1,16 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local agent memory (stateless runner persistent directory)
+.agent_memory/
+
+# Environment variables
+.env
+.env.*
+*.env
+
+# Operating system artifacts
+.DS_Store
+Thumbs.db
