@@ -9,7 +9,7 @@ import shutil
 import tempfile
 import unittest
 
-from agent_core import AgentConfig, AutonomousAgent, LLMClient, create_memory_bridge
+from agent_core import AgentConfig, AutonomousAgent, LLMClient, Toolbox, create_memory_bridge
 from cloud_memory_bridge import GitHubGistMemoryBridge
 from memory_bridge import LocalFileMemoryBridge, MemoryLogEntry, ShortTermState
 from state_manager import AgentContext, AgentState, StateManager, StateTransitionError
@@ -106,6 +106,75 @@ class TestAutonomousAgentCore(unittest.TestCase):
         self.assertIn("WAKE_UP", event_types)
         self.assertIn("PLAN", event_types)
         self.assertIn("ACTION", event_types)
+
+
+class TestToolbox(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.toolbox = Toolbox(workspace_root=self.test_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_file_writer_tool_success_and_traversal_prevention(self):
+        # 1. Normal successful write
+        res = self.toolbox.file_writer_tool("sub/output.txt", "Test content payload")
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["bytes_written"], len("Test content payload"))
+
+        # Verify content on disk
+        target = os.path.join(self.test_dir, "sub", "output.txt")
+        self.assertTrue(os.path.exists(target))
+        with open(target, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "Test content payload")
+
+        # 2. Directory traversal attempt outside workspace root
+        traversal_res = self.toolbox.file_writer_tool("../outside.txt", "Malicious content")
+        self.assertEqual(traversal_res["status"], "ERROR")
+        self.assertIn("Security violation", traversal_res["error"])
+
+    def test_web_browser_tool_mock(self):
+        from unittest.mock import MagicMock, patch
+
+        html_sample = "<html><body><h1>Tech Radar</h1><p>Open jobs for AI Engineers.</p></body></html>"
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+            mock_resp.read.return_value = html_sample.encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_urlopen.return_value = mock_resp
+
+            res = self.toolbox.web_browser_tool("https://news.ycombinator.com")
+            self.assertEqual(res["status"], "SUCCESS")
+            self.assertEqual(res["http_status"], 200)
+            self.assertIn("Tech Radar", res["content_preview"])
+            self.assertIn("Open jobs for AI Engineers", res["content_preview"])
+
+    def test_http_poster_tool_mock(self):
+        from unittest.mock import MagicMock, patch
+
+        mock_reply = {"id": "123", "received": True}
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.status = 201
+            mock_resp.read.return_value = json.dumps(mock_reply).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_urlopen.return_value = mock_resp
+
+            res = self.toolbox.http_poster_tool("https://api.platform.com/submit", {"task": "lead_gen"})
+            self.assertEqual(res["status"], "SUCCESS")
+            self.assertEqual(res["http_status"], 201)
+            self.assertEqual(res["response"], mock_reply)
+
+    def test_execute_tool_dispatch(self):
+        res = self.toolbox.execute_tool(
+            "file_writer_tool",
+            {"filepath": "dispatch_test.txt", "content": "Toolbox dispatch works"},
+        )
+        self.assertEqual(res["status"], "SUCCESS")
+        unknown = self.toolbox.execute_tool("non_existent_tool", {})
+        self.assertEqual(unknown["status"], "ERROR")
 
 
 

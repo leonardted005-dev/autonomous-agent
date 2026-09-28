@@ -1,6 +1,6 @@
 """Continuous Autonomous Agent Framework - Stateless Cloud Runner Architecture."""
 
-from agent_core import AgentConfig, AutonomousAgent, LLMClient, create_memory_bridge
+from agent_core import AgentConfig, AutonomousAgent, LLMClient, Toolbox, create_memory_bridge
 from cloud_memory_bridge import GitHubGistMemoryBridge
 from memory_bridge import BaseMemoryBridge, LocalFileMemoryBridge, MemoryLogEntry, ShortTermState
 from state_manager import AgentContext, AgentState, StateManager, StateTransitionError, StateTransitionRecord
@@ -20,4 +20,5 @@ __all__ = [
     "AutonomousAgent",
     "AgentConfig",
     "LLMClient",
+    "Toolbox",
 ]
