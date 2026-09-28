@@ -157,5 +157,36 @@ To enable cloud autonomy, configure your secrets in GitHub:
 3. Click **Create secret gist**.
 4. Copy the alphanumeric ID from the end of the URL and save it as the `GIST_ID` secret in your repository.
 
-#   a u t o n o m o u s - a g e n t  
- 
+## 🚀 Precision Timing with External Cron Providers
+
+GitHub Actions' internal cron schedule engine runs on shared public worker pools, which can experience standard free-tier load scheduling delays (typically 5 to 30 minutes). If your agent requires precision timing or immediate execution, you can trigger the runner on-demand with to-the-minute accuracy using an external pinger service (such as [cron-job.org](https://cron-job.org), EasyCron, or custom webhooks).
+
+External cron providers trigger GitHub's official REST API endpoint for `workflow_dispatch`.
+
+### Step-by-Step Configuration (e.g. cron-job.org)
+
+1. **Target Endpoint URL**:
+   ```text
+   https://api.github.com/repos/leonardted005-dev/autonomous-agent/actions/workflows/agent_cron.yml/dispatches
+   ```
+   *(General format: `https://api.github.com/repos/<OWNER>/<REPO>/actions/workflows/<WORKFLOW_FILE>/dispatches`)*
+
+2. **HTTP Method**:
+   `POST`
+
+3. **Required Request Headers**:
+   - `Authorization: Bearer <YOUR_GITHUB_TOKEN>` *(Personal Access Token with `repo` or `actions:write` scope)*
+   - `Accept: application/vnd.github+json`
+   - `X-GitHub-Api-Version: 2022-11-28`
+   - `Content-Type: application/json`
+
+4. **Required JSON Body Payload**:
+   ```json
+   { "ref": "main" }
+   ```
+
+5. **Schedule**:
+   Set your exact desired interval (e.g., every 30 minutes, 15 minutes, or hourly) in the external pinger's dashboard.
+
+Whenever the external cron fires, GitHub Actions will immediately initiate the runner, bypassing the native scheduling queue while respecting the concurrency lock (`group: agent-loop`) and timeout boundaries.
+
