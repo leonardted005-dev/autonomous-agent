@@ -7,7 +7,7 @@ to save and load agent state across ephemeral runners (e.g., GitHub Actions).
 
 Key Capabilities:
 1. Zero heavy/paid dependencies - relies solely on Python built-ins.
-2. Authenticates via GITHUB_TOKEN environment variable.
+2. Authenticates via CUSTOM_GIT_TOKEN environment variable.
 3. Manages short-term state in a designated JSON file inside a private Gist.
 4. Manages long-term audit logs in a designated JSONL file inside the Gist.
 5. Graceful fallback: If the Gist API fails, network drops, or credentials are invalid,
@@ -45,14 +45,14 @@ class GitHubGistMemoryBridge(BaseMemoryBridge):
         timeout: int = 20,
     ) -> None:
         self.gist_id = gist_id or os.getenv("GIST_ID") or os.getenv("MEMORY_GIST_ID")
-        self.github_token = github_token or os.getenv("GITHUB_TOKEN")
+        self.github_token = github_token or os.getenv("CUSTOM_GIT_TOKEN")
         self.api_base = (api_base or os.getenv("GITHUB_API_BASE") or self.DEFAULT_API_BASE).rstrip("/")
         self.timeout = timeout
         self.fallback = fallback_bridge or LocalFileMemoryBridge()
 
         if not self.github_token:
             logger.warning(
-                "GITHUB_TOKEN is not configured. GitHubGistMemoryBridge will route requests to fallback."
+                "CUSTOM_GIT_TOKEN is not configured. GitHubGistMemoryBridge will route requests to fallback."
             )
         if not self.gist_id:
             logger.warning(
@@ -61,7 +61,7 @@ class GitHubGistMemoryBridge(BaseMemoryBridge):
 
     @property
     def is_configured(self) -> bool:
-        """Checks if both GIST_ID and GITHUB_TOKEN are set."""
+        """Checks if both GIST_ID and CUSTOM_GIT_TOKEN are set."""
         return bool(self.gist_id and self.github_token)
 
     def _state_filename(self, agent_id: str) -> str:

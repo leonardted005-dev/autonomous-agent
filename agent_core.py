@@ -55,21 +55,21 @@ class AgentConfig:
     ).lower()
     llm_model: str = os.getenv(
         "LLM_MODEL",
-        "llama-3.3-70b-versatile" if os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY") else "gpt-4o-mini"
+        "llama-3.1-70b-versatile" if os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY") else "gpt-4o-mini"
     )
     llm_api_base: str = os.getenv(
         "LLM_API_BASE",
         "https://api.groq.com/openai/v1" if os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY") else "https://api.openai.com/v1"
     )
     request_timeout: int = int(os.getenv("LLM_REQUEST_TIMEOUT", "45"))
-    github_token: Optional[str] = os.getenv("GITHUB_TOKEN")
+    github_token: Optional[str] = os.getenv("CUSTOM_GIT_TOKEN")
     gist_id: Optional[str] = os.getenv("GIST_ID") or os.getenv("MEMORY_GIST_ID")
 
 
 def create_memory_bridge(config: Optional[AgentConfig] = None) -> BaseMemoryBridge:
     """
     Factory function resolving appropriate memory bridge based on runtime environment.
-    Automatically switches to GitHubGistMemoryBridge if GITHUB_TOKEN and GIST_ID are present,
+    Automatically switches to GitHubGistMemoryBridge if CUSTOM_GIT_TOKEN and GIST_ID are present,
     otherwise uses LocalFileMemoryBridge with local disk persistence.
     """
     cfg = config or AgentConfig()
@@ -78,13 +78,13 @@ def create_memory_bridge(config: Optional[AgentConfig] = None) -> BaseMemoryBrid
 
     if token and gist_id:
         logger.info(
-            "Cloud environment detected (GITHUB_TOKEN and GIST_ID found). "
+            "Cloud environment detected (CUSTOM_GIT_TOKEN and GIST_ID found). "
             "Initializing GitHubGistMemoryBridge (Gist: %s).",
             gist_id,
         )
         return GitHubGistMemoryBridge(gist_id=gist_id, github_token=token)
     elif token or gist_id:
-        missing = "GIST_ID" if not gist_id else "GITHUB_TOKEN"
+        missing = "GIST_ID" if not gist_id else "CUSTOM_GIT_TOKEN"
         logger.warning(
             "Partial cloud memory credentials detected (%s missing). "
             "Defaulting to LocalFileMemoryBridge.",
