@@ -79,7 +79,7 @@ class GitHubGistMemoryBridge(BaseMemoryBridge):
             "X-GitHub-Api-Version": "2022-11-28",
         }
         if self.github_token:
-            headers["Authorization"] = f"Bearer {self.github_token}"
+            headers["Authorization"] = f"Bearer {self.github_token.strip()}"
         return headers
 
     def _fetch_gist_data(self) -> Optional[Dict[str, Any]]:
