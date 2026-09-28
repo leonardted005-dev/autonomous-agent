@@ -52,6 +52,7 @@ class AgentConfig:
     """Agent runtime configuration sourced from environment variables."""
     agent_id: str = os.getenv("AGENT_ID", "default_stateless_agent")
     max_steps_per_run: int = int(os.getenv("MAX_STEPS_PER_RUN", "5"))
+    max_tool_calls_per_cycle: int = int(os.getenv("MAX_TOOL_CALLS_PER_CYCLE", "5"))
     llm_provider: str = os.getenv(
         "LLM_PROVIDER",
         "groq" if os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY") else "openai"
@@ -109,10 +110,49 @@ class Toolbox:
         self.request_timeout = request_timeout
         logger.info("Toolbox initialized with workspace root: %s", self.workspace_root)
 
-    def web_browser_tool(self, url: str) -> Dict[str, Any]:
+    @staticmethod
+    def _format_cookie_header(session_cookies: Optional[Dict[str, str]]) -> str:
+        """
+        Formats a cookie dict ('name' -> 'value') into a standard Cookie header string.
+        Entries with empty names are dropped; control characters are stripped for safety.
+        """
+        if not session_cookies or not isinstance(session_cookies, dict):
+            return ""
+        pairs = []
+        for name, value in session_cookies.items():
+            clean_name = re.sub(r"[\x00-\x1F\x7F;\s=]", "", str(name))
+            clean_value = re.sub(r"[\x00-\x1F\x7F;]", "", str(value)).strip()
+            if clean_name and clean_value:
+                pairs.append(f"{clean_name}={clean_value}")
+        return "; ".join(pairs)
+
+    @staticmethod
+    def parse_cookie_string(cookie_string: str) -> Dict[str, str]:
+        """
+        Parses a raw browser cookie string ('name=value; name2=value2') pasted from
+        developer tools into a clean name -> value dict raedy for session injection.
+        Attributes without '=' (Secure, HttpOnly, SameSite, Path...) are skipped.
+        """
+        cookies: Dict[str, str] = {}
+        if not cookie_string or not isinstance(cookie_string, str):
+            return cookies
+        for chunk in cookie_string.split(";"):
+            chunk = chunk.strip()
+            if "=" not in chunk:
+                continue
+            name, _, value = chunk.partition("=")
+            name = name.strip()
+            value = value.strip().strip('"')
+            if name and value:
+                cookies[name] = value
+        return cookies
+
+    def web_browser_tool(self, url: str, session_cookies: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """
         Fetches text/HTML/RSS content from web endpoints using standard urllib.request.
         Strips scripts, styles, and markup to return clean textual data.
+        If a 'session_cookies' dict is provided (e.g. from Gist state), it is injected
+        as a standard 'Cookie' header so authenticated pages can be read.
         """
         logger.info("Toolbox: web_browser_tool called on URL: %s", url)
         if not url or not isinstance(url, str):
@@ -122,12 +162,18 @@ class Toolbox:
         if parsed.scheme not in ("http", "https"):
             return {"status": "ERROR", "error": f"Unsupported URL scheme '{parsed.scheme}'. Only http and https are allowed."}
 
+        cookie_header = self._format_cookie_header(session_cookies)
+        request_headers = {
+            "User-Agent": "AutonomousAgent-Toolbox/1.0 (+https://github.com/leonardted005-dev/autonomous-agent)",
+            "Accept": "text/html,application/xhtml+xml,application/xml,text/plain,application/json,*/*",
+        }
+        if cookie_header:
+            request_headers["Cookie"] = cookie_header
+            logger.info("Toolbox: injecting %d session cookie(s) into web request.", len(session_cookies or {}))
+
         req = urllib.request.Request(
             url,
-            headers={
-                "User-Agent": "AutonomousAgent-Toolbox/1.0 (+https://github.com/leonardted005-dev/autonomous-agent)",
-                "Accept": "text/html,application/xhtml+xml,application/xml,text/plain,application/json,*/*",
-            },
+            headers=request_headers,
             method="GET",
         )
 
@@ -252,7 +298,7 @@ class Toolbox:
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatches dynamic tool execution by name with arguments."""
         if tool_name == "web_browser_tool":
-            return self.web_browser_tool(url=arguments.get("url", ""))
+            return self.web_browser_tool(url=arguments.get("url", ""), session_cookies=arguments.get("session_cookies"))
         elif tool_name == "file_writer_tool":
             return self.file_writer_tool(
                 filepath=arguments.get("filepath", ""),
@@ -581,6 +627,9 @@ class AutonomousAgent:
         # Human-in-the-loop gate bookkeeping (hydrated from persisted state)
         self._resume_state: Optional[str] = None
         self._human_decision: Optional[str] = None
+        # Invisible cookie-session handshake + chained working memory (hydrated on wake)
+        self.session_cookies: Dict[str, str] = {}
+        self._working_memory: List[str] = []
 
     def initialize_state(self) -> None:
         """Hydrates previous context from memory bridge or starts fresh WAKE_UP context."""
@@ -617,6 +666,10 @@ class AutonomousAgent:
                 payload={"cycle_count": self.state_manager.context.cycle_count},
             ),
         )
+        # Hydrate the live session cookie map from persisted top-level state.
+        self.session_cookies: Dict[str, str] = dict(saved_state.session_cookies) if saved_state else {}
+        # Working memory is per-run (chained tool outputs observed this cycle only).
+        self._working_memory = []
 
     def persist_current_state(self) -> None:
         """Saves current ephemeral context into memory bridge for the next stateless run."""
@@ -630,8 +683,33 @@ class AutonomousAgent:
             cycle_count=ctx.cycle_count,
             active_plan=ctx.active_plan,
             context_data=ctx.payload,
+            session_cookies=getattr(self, "session_cookies", {}) or {},
         )
         self.memory.save_short_term_state(self.config.agent_id, snapshot)
+
+    def update_session_cookies(self, cookies: Dict[str, str]) -> Dict[str, str]:
+        """
+        Merges human-provided session cookies into live memory so web reads reuse
+        the authenticated session without ever learning passwords. Returns the map.
+        """
+        clean: Dict[str, str] = {}
+        if isinstance(cookies, dict):
+            for key, value in cookies.items():
+                name = str(key).strip()
+                val = str(value).strip()
+                if name and val:
+                    clean[name] = val
+        session = getattr(self, "session_cookies", None)
+        if not isinstance(session, dict):
+            session = {}
+            self.session_cookies = session
+        session.update(clean)
+        return dict(session)
+
+    def _redacted_session_cookies(self) -> Dict[str, str]:
+        """Returns name-only cookie metadata for logs/proposals (values never logged)."""
+        session = getattr(self, "session_cookies", {}) or {}
+        return {str(k): f"<redacted:{len(str(v))}ch>" for k, v in session.items()} if isinstance(session, dict) else {}
 
     def generate_monologue(self, prompt: str) -> str:
         """Enforces an internal structured monologue and autonomous reasoning from the AI brain."""
@@ -639,18 +717,29 @@ class AutonomousAgent:
             "You are a fully self-improving autonomous entity. Your objective is to identify digital arbitrage, freelance development tasks, "
             "or automated micro-business opportunities. Browse public boards and tech updates to identify gaps and other ways you can "
             "think of or find online to make money. In the PLAN phase, look at your long-term memory Gist, decide what the most "
-            "lucrative or educational digital task is right now, select a tool from your toolbox, and execute it. Log your successes "
-            "and failures to adapt your behavior over time.\n\n"
+            "lucrative or educational digital task is right now, select tools from your toolbox, and execute them in sequence "
+            "(up to 5 chained tool calls per cycle). Log your successes and failures to adapt your behavior over time.\n\n"
+            "ACCOUNT WALL ROUTING GATE (MANDATORY): You are forbidden from skipping gated work. If you discover a "
+            "high-value platform or work opportunity (e.g. Upwork, Freelancer, GitHub Sponsors) that requires "
+            "registration, sign-up, or login, you MUST NOT skip it, work around it, or pretend it does not exist. "
+            "Instead, immediately halt and route it into an active gate: emit a TOOL_CALL to file_writer_tool "
+            "writing 'human_action_needed.json' that contains the platform name, a registration link, and the reason "
+            "access is needed. This raises an 'Account Creation & Verification Proposal' so the human approves it "
+            "on the dashboard. Treat every login wall, signup form, or email-verification demand as this active "
+            "routing gate, never as a reason to abandon the opportunity.\n\n"
             "CRITICAL SAFETY BOUNDARY: If an operation requires a legal profile, an invoice, or an account creation step, you must "
             "formulate a structured 'Human Intervention Request' detailing the platform, the reason, and the registration link, write "
-            "it to a file named `human_action_needed.json`, and pause that specific thread until the asset is provided.\n\n"
+            "it to a file named `human_action_needed.json`, and pause that specific thread until the asset is provided. "
+            "NEVER fabricate credentials or attempt to create accounts yourself.\n\n"
             "AVAILABLE TOOLBOX CAPABILITIES:\n"
-            "1. web_browser_tool(url: str): Fetches HTML/RSS/text content from public feeds, job boards, or websites.\n"
+            "1. web_browser_tool(url: str): Fetches HTML/RSS/text content from public feeds, job boards, or websites. "
+            "If 'session_cookies' are present in memory, it reuses your authenticated session automatically.\n"
             "2. file_writer_tool(filepath: str, content: str): Writes scripts, portfolios, reports, or data files in local workspace.\n"
             "3. http_poster_tool(url: str, payload: dict, headers: dict = None): Sends POST requests to simulate platform actions or submit data.\n\n"
-            "TOOL CALL FORMAT:\n"
-            "To invoke a tool in your plan, write a line with this format:\n"
-            'TOOL_CALL: <tool_name> {"arg_name": "arg_value", ...}\n'
+            "TOOL CALL FORMAT (CHAIN UP TO 5 SEQUENTIALLY):\n"
+            "To invoke tools in your plan, write numbered TOOL_CALL lines in execution order. Each line runs as one "
+            "chain link; the output of link N is appended to working memory and visible before link N+1 executes.\n"
+            'Example: TOOL_CALL: web_browser_tool {"url": "https://news.example/feed"}\n'
             'Example: TOOL_CALL: file_writer_tool {"filepath": "notes.txt", "content": "Autonomous discovery log"}\n\n'
             "Always structure your output strictly in these sections:\n"
             "THINKING PROCESS:\n"
@@ -668,40 +757,141 @@ class AutonomousAgent:
 
     def _parse_and_execute_step(self, step_desc: str) -> Dict[str, Any]:
         """
-        Parses step description for TOOL_CALL directives or embedded JSON tool commands.
-        Executes via Toolbox if detected, returning structured results.
+        Parses a step description for TOOL_CALL directives (one or several) and executes
+        them as a bounded internal batch, returning a combined result record.
         """
         result: Dict[str, Any] = {
             "step": step_desc,
             "status": "COMPLETED",
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tool_calls": [],
         }
 
-        # Check for explicit TOOL_CALL directive
-        tool_call_match = re.search(r"TOOL_CALL:\s*([a-zA-Z0-9_]+)\s*(\{.*?\})", step_desc)
-        if not tool_call_match:
-            # Check for generic inline tool invocation: <tool_name>(...) or ```json
-            tool_call_match = re.search(r"([a-zA-Z0-9_]+_tool)\s*(\{.*?\})", step_desc)
+        calls = self._extract_tool_calls(step_desc)
+        if not calls:
+            return result
 
-        if tool_call_match:
-            tool_name = tool_call_match.group(1).strip()
-            args_str = tool_call_match.group(2).strip()
-            try:
-                args = json.loads(args_str)
-                logger.info("Executing detected tool call: %s with args: %s", tool_name, args)
-                tool_output = self.toolbox.execute_tool(tool_name, args)
-                result["tool_executed"] = tool_name
-                result["tool_arguments"] = args
-                result["tool_output"] = tool_output
-                result["status"] = tool_output.get("status", "COMPLETED")
-                if result["status"] == "ERROR":
-                    logger.warning("Tool %s executed with error: %s", tool_name, tool_output.get("error"))
-            except Exception as parse_err:
-                logger.error("Failed to parse/execute tool call in step '%s': %s", step_desc, parse_err)
+        budget = max(1, int(getattr(self.config, "max_tool_calls_per_cycle", 5) or 5))
+        for tool_name, args in calls[:budget]:
+            call_record = self._execute_single_tool_call(tool_name, args)
+            result["tool_calls"].append(call_record)
+            if call_record.get("status") == "ERROR":
                 result["status"] = "ERROR"
-                result["error"] = f"Failed to execute tool call: {str(parse_err)}"
+        if len(calls) > budget:
+            result["status"] = "ERROR"
+            result["error"] = (
+                f"Tool-chain budget exceeded: planned {len(calls)} TOOL_CALLs, "
+                f"executed {budget}. Increase MAX_TOOL_CALLS_PER_CYCLE to run the rest."
+            )
+            logger.warning("Tool-chain budget exceeded (%d planned, %d executed).", len(calls), budget)
+        elif result.get("tool_calls"):
+            first = result["tool_calls"][0]
+            result["tool_executed"] = first.get("tool_executed")
+            result["tool_arguments"] = first.get("tool_arguments")
+            result["tool_output"] = first.get("tool_output")
 
         return result
+
+    @staticmethod
+    def _extract_tool_calls(step_desc: str) -> List[Tuple[str, Dict[str, Any]]]:
+        """
+        Extracts every ordered (tool_name, arguments) TOOL_CALL from a step description,
+        supporting full JSON args as well as url-only shorthand for web reads.
+        """
+        calls: List[Tuple[str, Dict[str, Any]]] = []
+        if not step_desc:
+            return calls
+        for match in re.finditer(r"TOOL_CALL:\s*([a-zA-Z0-9_]+)\s*(\{.*?\})", step_desc):
+            try:
+                args = json.loads(match.group(2).strip())
+                if isinstance(args, dict):
+                    calls.append((match.group(1).strip(), args))
+            except Exception:
+                continue
+        if not calls:
+            for match in re.finditer(r"([a-zA-Z0-9_]+_tool)\s*(\{.*?\})", step_desc):
+                try:
+                    args = json.loads(match.group(2).strip())
+                    if isinstance(args, dict):
+                        calls.append((match.group(1).strip(), args))
+                except Exception:
+                    continue
+        if not calls:
+            for match in re.finditer(
+                r"([a-zA-Z0-9_]+_tool)\s+(https?://[^\s\"'`]+)", step_desc
+            ):
+                calls.append((match.group(1).strip(), {"url": match.group(2).strip()}))
+        return calls
+
+    def _execute_single_tool_call(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Runs one chained tool link and returns its normalized result record."""
+        record: Dict[str, Any] = {
+            "tool_executed": tool_name,
+            "tool_arguments": dict(args),
+            "status": "COMPLETED",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            logger.info("Executing detected tool call: %s with args: %s", tool_name, args)
+            if tool_name == "web_browser_tool":
+                tool_output = self.toolbox.execute_tool(
+                    tool_name,
+                    {
+                        **args,
+                        "session_cookies": args.get("session_cookies")
+                        or getattr(self, "session_cookies", {})
+                        or None,
+                    },
+                )
+            else:
+                tool_output = self.toolbox.execute_tool(tool_name, args)
+            record["tool_output"] = tool_output
+            record["status"] = tool_output.get("status", "COMPLETED")
+            if record["status"] == "ERROR":
+                logger.warning("Tool %s executed with error: %s", tool_name, tool_output.get("error"))
+        except Exception as parse_err:
+            logger.error("Failed to execute tool call '%s': %s", tool_name, parse_err)
+            record["status"] = "ERROR"
+            record["error"] = f"Failed to execute tool call: {str(parse_err)}"
+        return record
+
+    @staticmethod
+    def _wrote_human_action_file(result: Dict[str, Any]) -> bool:
+        """True when a batched tool result wrote human_action_needed.json (single or multi-call)."""
+        if not isinstance(result, dict):
+            return False
+        for args in [result.get("tool_arguments"), *[c.get("tool_arguments") for c in result.get("tool_calls", []) or []]]:
+            if isinstance(args, dict) and str(args.get("filepath", "")).endswith("human_action_needed.json"):
+                return True
+        return False
+
+    @staticmethod
+    def _summarize_tool_output(result: Dict[str, Any]) -> str:
+        """
+        Compresses one batched step result into a short working-memory note.
+        Never includes session cookie values.
+        """
+        if not isinstance(result, dict):
+            return ""
+        parts: List[str] = []
+        calls = result.get("tool_calls") or []
+        if calls:
+            for call in calls:
+                tool = call.get("tool_executed", "tool")
+                output = call.get("tool_output") or {}
+                if tool == "web_browser_tool":
+                    preview = str(output.get("content_preview", "") or "")[:400]
+                    parts.append(f"{tool}: {output.get('status', '?')} {preview}".strip())
+                elif tool == "file_writer_tool":
+                    parts.append(f"{tool}: wrote {call.get('tool_arguments', {}).get('filepath', '?')}")
+                elif tool == "http_poster_tool":
+                    parts.append(f"{tool}: {output.get('status', '?')} -> {output.get('url', '?')}")
+                else:
+                    parts.append(f"{tool}: {call.get('status', '?')}")
+        else:
+            parts.append(str(result.get("step", ""))[:200])
+        summary = " | ".join(p for p in parts if p)[:600]
+        return summary
 
     # ------------------------------------------------------------------
     # Human-in-the-Loop Dashboard Gateway helpers
@@ -711,17 +901,21 @@ class AutonomousAgent:
     APPROVAL_TRIGGER_PATTERNS = (
         r"external platform", r"marketplace", r"payment", r"transaction", r"invoice",
         r"account creation", r"create an account", r"sign ?up", r"registration",
-        r"register", r"publish", r"submit (?:a )?(?:proposal|listing|pitch)", r"\bpitch",
-        r"freelance", r"\bsell\b", r"checkout", r"payout", r"escrow", r"\bbid\b",
-        r"human_action_needed", r"human intervention", r"bank transfer", r"paypal",
-        r"upload (?:asset|listing)", r"post (?:a )?listing", r"financial transaction",
+        r"register", r"registration link", r"login wall", r"log ?in", r"sign-?in required",
+        r"verify (?:your |email |account|identity)", r"email verification", r"two-?factor",
+        r"github sponsors", r"sponsor profile", r"publish", r"submit (?:a )?(?:proposal|listing|pitch)",
+        r"\bpitch", r"freelance", r"\bsell\b", r"checkout", r"payout", r"escrow",
+        r"\bbid\b", r"human_action_needed", r"human intervention", r"human review",
+        r"bank transfer", r"paypal", r"upload (?:asset|listing)", r"post (?:a )?listing",
+        r"financial transaction", r"needs (?:an? )?(?:account|verification|approval)",
     )
 
     _KNOWN_PLATFORMS = (
         "Fiverr", "Upwork", "Toptal", "Gumroad", "Etsy", "GitHub", "GitLab",
-        "LeetCode", "TaskRabbit", "Udemy", "Product Hunt", "Hacker News",
-        "Freelancer", "PeoplePerHour", "Contra", "Legiit", "Kwork", "Medium",
-        "Substack", "itch.io", "Stack Overflow", "CodeCanyon", "ThemeForest",
+        "GitHub Sponsors", "LeetCode", "TaskRabbit", "Udemy", "Product Hunt",
+        "Hacker News", "Freelancer", "PeoplePerHour", "Contra", "Legiit",
+        "Kwork", "Medium", "Substack", "itch.io", "Stack Overflow", "CodeCanyon",
+        "ThemeForest",
     )
 
     def _requires_human_approval(self, text: str) -> bool:
@@ -735,6 +929,8 @@ class AutonomousAgent:
 
     def _classify_proposal_type(self, text: str) -> str:
         low = text.lower()
+        if re.search(r"account creation|verification|registration|login|signup|sign-?up|log ?in", low):
+            return "Account Creation & Verification"
         if re.search(r"freelance|pitch|bid on|client outreach|proposal to", low):
             return "Freelance Pitch"
         if re.search(r"asset|template|code sale|sell.{0,20}(code|script|plugin|theme)|gumroad|listing", low):
@@ -787,16 +983,31 @@ class AutonomousAgent:
         stamp = datetime.now(timezone.utc).isoformat()
         run_id = self.state_manager.context.run_id if self.state_manager else "unknown_run"
         task_id = hashlib.sha1(f"{run_id}:{stamp}:{source_text[:80]}".encode("utf-8")).hexdigest()[:12]
-        return {
+        proposal_type = self._classify_proposal_type(source_text)
+        proposal: Dict[str, Any] = {
             "task_id": task_id,
-            "type": self._classify_proposal_type(source_text),
+            "type": proposal_type,
             "target_platform": self._extract_target_platform(source_text),
             "proposed_action": source_text.strip(),
             "generated_files": self._collect_generated_files(),
             "estimated_revenue": self._extract_estimated_revenue(source_text),
             "detected_in_phase": phase,
             "created_at": stamp,
+            "requires_human": True,
         }
+        # Account-wall gate: attach the registration link and session availability.
+        if proposal_type == "Account Creation & Verification":
+            proposal["requires_account"] = True
+            proposal["registration_link"] = self._extract_registration_link(source_text)
+            proposal["session_active"] = bool(self.session_cookies)
+            proposal["session_cookie_names"] = sorted(self.session_cookies.keys())
+        return proposal
+
+    @staticmethod
+    def _extract_registration_link(text: str) -> str:
+        """Pulls the first http(s) registration/login URL out of a gate request."""
+        match = re.search(r"https?://[^\s\"'`\)]+", text)
+        return match.group(0).rstrip(".,;") if match else "TBD"
 
     def _evaluate_human_gate(self) -> str:
         """
@@ -919,16 +1130,23 @@ class AutonomousAgent:
             else:
                 recent_logs = self.memory.retrieve_recent_logs(self.config.agent_id, limit=5)
                 log_summaries = [l.to_dict() for l in recent_logs]
+                session_hint = (
+                    f"Active session cookies (names only): {sorted(self.session_cookies.keys())}"
+                    if self.session_cookies else "No session cookies provided."
+                )
                 plan_prompt = (
                     f"Agent ID: {self.config.agent_id}\n"
                     f"Current Cycle: {ctx.cycle_count}\n"
                     f"Recent Logs: {json.dumps(log_summaries)}\n"
-                    "Task: Synthesize context and formulate an atomic operational plan."
+                    f"{session_hint}\n"
+                    "Task: Synthesize context and formulate an atomic operational plan "
+                    "(up to 5 chained TOOL_CALL steps)."
                 )
                 monologue = self.generate_monologue(plan_prompt)
                 logger.info("Internal Monologue Generated:\n%s", monologue)
                 ctx.active_plan = [
-                    line.strip() for line in monologue.splitlines() if line.strip().startswith(("1.", "2.", "3."))
+                    line.strip() for line in monologue.splitlines()
+                    if re.match(r"^\d+\.\s", line.strip())
                 ]
 
                 # PLAN-phase Human-in-the-Loop detection
@@ -953,23 +1171,48 @@ class AutonomousAgent:
                 ),
             )
 
-            # --- 2. PLAN -> EXECUTE ---
+            # --- 2. PLAN -> EXECUTE (multi-step tool chaining) ---
             self.state_manager.transition_to(AgentState.EXECUTE, reason="Executing plan steps")
             step_count = min(len(ctx.active_plan), self.config.max_steps_per_run)
-            logger.info("Executing %d planned steps for this cycle...", step_count)
+            budget = max(1, int(getattr(self.config, "max_tool_calls_per_cycle", 5) or 5))
+            logger.info(
+                "Executing %d planned step(s) with internal tool-chain budget of %d link(s)...",
+                step_count, budget,
+            )
 
             triggered_step: Optional[str] = None
+            tool_calls_used = 0
+            chained_working_memory: List[str] = list(getattr(self, "_working_memory", []) or [])
             for idx in range(step_count):
                 step_desc = ctx.active_plan[idx]
                 logger.info("Running Step [%d/%d]: %s", idx + 1, step_count, step_desc)
+                if tool_calls_used >= budget:
+                    logger.warning(
+                        "Tool-chain budget of %d exhausted at step %d; remaining plan deferred.",
+                        budget, idx + 1,
+                    )
+                    break
                 result = self._parse_and_execute_step(step_desc)
                 ctx.execution_results.append(result)
+
+                planned_calls = len(self._extract_tool_calls(step_desc))
+                observed_calls = len(result.get("tool_calls", [])) or (1 if planned_calls else 0)
+                tool_calls_used += max(1, observed_calls)
+
+                # Chain link: observe output into working memory for later links in this run.
+                summary = self._summarize_tool_output(result)
+                if summary:
+                    chained_working_memory.append(f"Step {idx + 1} outcome: {summary}")
+                # Keep the last 10 observations only (bounded context growth).
+                self._working_memory = chained_working_memory[-10:]
+                ctx.working_memory[:] = self._working_memory
+
                 if not approved_resume and triggered_step is None:
-                    wrote_human_file = str((result.get("tool_arguments") or {}).get("filepath", "")).endswith(
-                        "human_action_needed.json"
-                    )
+                    wrote_human_file = self._wrote_human_action_file(result)
                     if self._requires_human_approval(step_desc) or wrote_human_file:
                         triggered_step = step_desc
+
+            logger.info("Tool-chain batch finished: %d link(s) used of %d budgeted.", tool_calls_used, budget)
 
             self.memory.append_long_term_log(
                 self.config.agent_id,
@@ -993,11 +1236,13 @@ class AutonomousAgent:
                 logger.info("Cycle halted in PENDING_APPROVAL state awaiting dashboard review.")
                 return
 
-            # --- 3. EXECUTE -> EVALUATE ---
+            # --- 3. EXECUTE -> EVALUATE (chain summary included) ---
             self.state_manager.transition_to(AgentState.EVALUATE, reason="Assessing run results")
+            chain_notes = ctx.working_memory or getattr(self, "_working_memory", []) or []
             eval_prompt = (
                 f"Completed {len(self.state_manager.context.execution_results)} steps.\n"
                 f"Execution Results: {json.dumps(self.state_manager.context.execution_results)}\n"
+                f"Chained Working Memory: {json.dumps(chain_notes)}\n"
                 "Task: Evaluate if milestones succeeded and confirm safe completion."
             )
             eval_monologue = self.generate_monologue(eval_prompt)

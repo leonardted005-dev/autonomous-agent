@@ -187,6 +187,14 @@ tailwind.config = {
       <div id="proposalFiles" class="space-y-3"></div>
     </div>
 
+    <div class="mt-4">
+      <label for="inputInjectedCookies" class="text-[11px] uppercase tracking-widest text-slate-500 mb-2 block">Injected Cookie String <span class="normal-case tracking-normal text-slate-600">(optional · your session, never your password)</span></label>
+      <textarea id="inputInjectedCookies" rows="2" placeholder="sessionid=abc123; csrftoken=xyz789; _ga=GA1.2..." spellcheck="false"
+        class="mono w-full rounded-xl border border-slate-800 bg-slate-950/70 p-3 text-xs text-slate-300 placeholder-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500/40"></textarea>
+      <p class="mt-1 text-[11px] text-slate-600">Sign in on your own PC, copy the Cookie header from DevTools → Network, and paste it here. Clicking APPROVE stores it in the Gist so the agent wakes up logged in — it never sees your passwords.</p>
+      <p id="sessionBadge" class="hidden mt-2 inline-flex items-center gap-1.5 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-400">🍪 Session active</p>
+    </div>
+
     <div id="decisionArea" class="mt-6 flex flex-col sm:flex-row gap-3">
       <button id="approveBtn" class="flex-1 rounded-xl bg-emerald-500 px-6 py-4 text-base font-bold text-slate-950 shadow-lg shadow-emerald-500/25 hover:bg-emerald-400 active:scale-[.98] transition">🟢 APPROVE TASK</button>
       <button id="denyBtn" class="flex-1 rounded-xl bg-red-500 px-6 py-4 text-base font-bold text-white shadow-lg shadow-red-500/25 hover:bg-red-400 active:scale-[.98] transition">🔴 DENY TASK</button>
@@ -237,6 +245,21 @@ function stateFileName(agentId) {
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+/* Parses a raw browser Cookie header ('a=b; c=d') into {a:"b", c:"d"}.
+   Attribute tokens without '=' (Secure, HttpOnly, SameSite...) are skipped. */
+function parseCookieString(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "string") return out;
+  raw.split(";").forEach((chunk) => {
+    const piece = chunk.trim();
+    if (!piece || piece.indexOf("=") === -1) return;
+    const idx = piece.indexOf("=");
+    const name = piece.slice(0, idx).trim();
+    const value = piece.slice(idx + 1).trim().replace(/^"|"$/g, "");
+    if (name && value) out[name] = value;
+  });
+  return out;
 }
 let toastTimer = null;
 function showToast(kind, message) {
@@ -410,6 +433,9 @@ function renderProposal(proposal, decision) {
   document.getElementById("approveBtn").innerHTML = "🟢 APPROVE TASK";
   document.getElementById("denyBtn").innerHTML = "🔴 DENY TASK";
 
+  // Cookie handshake field: reset per proposal, mirror any active session.
+  const cookieBox = document.getElementById("inputInjectedCookies");
+  if (cookieBox) cookieBox.value = "";
   if (decision) {
     area.classList.add("hidden");
     successText.textContent =
@@ -435,6 +461,19 @@ function renderState(state) {
   document.getElementById("metricPlatform").textContent = pending ? (proposal.target_platform || "—") : "—";
   document.getElementById("stateReason").textContent =
     `Updated ${state.last_updated || "—"} · run ${state.run_id || "—"}`;
+
+  // Invisible cookie-session handshake status (names only, values never shown).
+  const sessionBadge = document.getElementById("sessionBadge");
+  const cookies = state.session_cookies && typeof state.session_cookies === "object" ? state.session_cookies : {};
+  const cookieNames = Object.keys(cookies);
+  if (sessionBadge) {
+    if (cookieNames.length) {
+      sessionBadge.textContent = `🍪 Session active · ${cookieNames.length} cookie(s)`;
+      sessionBadge.classList.remove("hidden");
+    } else {
+      sessionBadge.classList.add("hidden");
+    }
+  }
 
   const card = document.getElementById("proposalCard");
   const empty = document.getElementById("emptyState");
@@ -505,14 +544,34 @@ async function decide(decision) {
     updated.context_data = updated.context_data || {};
     updated.context_data.human_decision = decision;
     updated.last_updated = new Date().toISOString();
+
+    // Invisible cookie-session handshake: on APPROVE, persist any pasted cookies
+    // as top-level session state (name/value pairs only — never passwords).
+    if (decision === "APPROVED") {
+      const rawCookies = (document.getElementById("inputInjectedCookies") || {}).value || "";
+      const parsed = parseCookieString(rawCookies);
+      if (Object.keys(parsed).length) {
+        updated.session_cookies = Object.assign({}, updated.session_cookies || {}, parsed);
+      }
+    }
+
     const filename = stateFileName(cfg.agentId);
     await GitHubAPI.patchGistFile(cfg.gistId, cfg.token, filename, JSON.stringify(updated, null, 2));
     currentStateDoc = updated;
     renderState(updated);
+    const savedCookies = Object.keys(updated.session_cookies || {}).length;
+    const cookieNote = savedCookies
+      ? " 🍪 Session cookies saved — agent wakes up logged in."
+      : "";
+    // Reinforce the handshake in the in-card success banner as well as the toast.
+    if (cookieNote) {
+      const successEl = document.getElementById("decisionSuccessText");
+      if (successEl) successEl.textContent += cookieNote;
+    }
     showToast(
       "success",
       decision === "APPROVED"
-        ? "✅ Approved! Cloud runner will execute on the next 30-minute cron cycle."
+        ? "✅ Approved! Cloud runner will execute on the next 30-minute cron cycle." + cookieNote
         : "🚫 Denied. Task will be cleared on the agent's next wake-up."
     );
   } catch (e) {

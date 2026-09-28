@@ -153,7 +153,11 @@ function run() {
   check("tracker chips drawn", elements.get("tracker").children.length === 6, elements.get("tracker").children.length);
   check("file preview drawn", elements.get("proposalFiles").children.length === 1, elements.get("proposalFiles").children.length);
   check("decision buttons visible", !elements.get("decisionArea").classList.contains("hidden"));
+  check("cookie input present", !!elements.get("inputInjectedCookies"));
+  check("session badge hidden without cookies", elements.get("sessionBadge").classList.contains("hidden"));
 
+  // Simulate the human pasting a cookie string before approving.
+  elements.get("inputInjectedCookies").value = "sessionid=cookie_abc; csrftoken=tok_123; Secure";
   await sandbox.decide("APPROVED");
   await run();
 
@@ -163,8 +167,18 @@ function run() {
     : null;
   check("human_decision = APPROVED", patchedState && patchedState.context_data.human_decision === "APPROVED", patchedState && patchedState.context_data.human_decision);
   check("proposal preserved in patch", patchedState && patchedState.context_data.pending_proposal.task_id === "abc123def456");
+  check(
+    "session_cookies saved top-level on APPROVE",
+    patchedState && patchedState.session_cookies
+      && patchedState.session_cookies.sessionid === "cookie_abc"
+      && patchedState.session_cookies.csrftoken === "tok_123",
+    JSON.stringify(patchedState && patchedState.session_cookies)
+  );
+  check("cookie attributes skipped (no Secure key)", patchedState && !("Secure" in (patchedState.session_cookies || {})));
   check("success state shown", !elements.get("decisionSuccess").classList.contains("hidden"));
   check("success text mentions cron", /30-minute cron/.test(elements.get("decisionSuccessText").textContent), elements.get("decisionSuccessText").textContent);
+  check("success text mentions cookie handshake", /Session cookies saved/.test(elements.get("decisionSuccessText").textContent), elements.get("decisionSuccessText").textContent);
+  check("session badge visible after approve", !elements.get("sessionBadge").classList.contains("hidden"));
 
   const failed = results.filter((r) => !r.ok);
   results.forEach((r) => console.log((r.ok ? "PASS  " : "FAIL  ") + r.name + (r.ok ? "" : "  -> " + r.extra)));

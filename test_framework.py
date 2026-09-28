@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import MagicMock
 
 from agent_core import AgentConfig, AutonomousAgent, LLMClient, Toolbox, create_memory_bridge
 from cloud_memory_bridge import GitHubGistMemoryBridge
@@ -40,6 +41,20 @@ class TestStateManager(unittest.TestCase):
         # Directly transitioning WAKE_UP -> EXECUTE is disallowed by ALLOWED_TRANSITIONS
         with self.assertRaises(StateTransitionError):
             self.fsm.transition_to(AgentState.EXECUTE, reason="Illegal direct leap")
+
+    def test_working_memory_round_trip_and_reset(self):
+        self.context.working_memory.append("Step 1 outcome: file_writer_tool wrote a.txt")
+        payload = self.context.to_dict()
+        self.assertIn("working_memory", payload)
+        self.assertEqual(len(payload["working_memory"]), 1)
+
+        restored = AgentContext.from_dict(payload)
+        self.assertEqual(restored.working_memory, payload["working_memory"])
+
+        self.fsm.reset_for_new_cycle()
+        self.assertEqual(self.context.working_memory, [])
+        self.assertEqual(self.context.execution_results, [])
+        self.assertEqual(self.context.cycle_count, 2)
 
 
 class TestMemoryBridge(unittest.TestCase):
@@ -181,7 +196,11 @@ class TestHumanInTheLoop(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         self.bridge = LocalFileMemoryBridge(storage_dir=self.test_dir)
         self.config = AgentConfig(agent_id="hitl_agent", max_steps_per_run=3)
-        self.agent = AutonomousAgent(config=self.config, memory_bridge=self.bridge)
+        self.agent = AutonomousAgent(
+            config=self.config,
+            memory_bridge=self.bridge,
+            toolbox=Toolbox(workspace_root=self.test_dir),
+        )
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
@@ -289,6 +308,138 @@ class TestHumanInTheLoop(unittest.TestCase):
         self.assertTrue(self.agent._requires_human_approval("Submit listing to marketplace and collect payment"))
         self.assertTrue(self.agent._requires_human_approval("write human_action_needed.json for registration"))
         self.assertFalse(self.agent._requires_human_approval("Inspect local workspace files and summarize logs"))
+
+    def test_account_wall_gate_not_skipped(self):
+        # High-value platform requiring registration MUST route to a gate, not be skipped.
+        wall_text = (
+            "Discovered Upwork opportunity but access requires account creation and email "
+            "verification: https://www.upwork.com/nx/signup"
+        )
+        self.assertTrue(self.agent._requires_human_approval(wall_text))
+        self.agent.initialize_state()
+        proposal = self.agent._build_pending_proposal(wall_text, "PLAN")
+        self.assertEqual(proposal["type"], "Account Creation & Verification")
+        self.assertTrue(proposal["requires_account"])
+        self.assertEqual(proposal["registration_link"], "https://www.upwork.com/nx/signup")
+        self.assertEqual(proposal["target_platform"], "Upwork")
+        self.assertIn("account creation", proposal["proposed_action"].lower())
+
+    def test_account_wall_routes_to_pending_approval_end_to_end(self):
+        bridge = LocalFileMemoryBridge(storage_dir=tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, bridge.storage_dir, True)
+        agent = AutonomousAgent(config=AgentConfig(agent_id="wall_agent"), memory_bridge=bridge)
+        agent.notifier = MagicMock()
+        agent.generate_monologue = lambda prompt: (
+            "THINKING PROCESS:\n- Found high-value GitHub Sponsors lead needing login.\n"
+            "STEP-BY-STEP PLAN:\n"
+            "1. Account wall on GitHub Sponsors requires registration: https://github.com/sponsors/sign_up\n"
+            "2. Defer to human for account creation\n"
+            "3. Transition to evaluation\n"
+            "EXECUTION ASSESSMENT:\nHalted at routing gate."
+        )
+        agent.run_cycle()
+
+        agent.notifier.send_alerts.assert_called_once()
+        persisted = bridge.load_short_term_state("wall_agent")
+        self.assertEqual(persisted.current_state, AgentState.PENDING_APPROVAL.value)
+        stored = persisted.context_data["pending_proposal"]
+        self.assertEqual(stored["type"], "Account Creation & Verification")
+        self.assertTrue(stored["requires_account"])
+        self.assertIn("github.com", stored["registration_link"])
+
+    def test_multi_tool_chain_batch_execution(self):
+        # A single step may carry several TOOL_CALL links; all run in one cycle.
+        step = (
+            '1. TOOL_CALL: file_writer_tool {"filepath": "chain_a.txt", "content": "first"} '
+            'TOOL_CALL: file_writer_tool {"filepath": "chain_b.txt", "content": "second"} '
+            'TOOL_CALL: file_writer_tool {"filepath": "chain_c.txt", "content": "third"}'
+        )
+        self.agent.initialize_state()
+        result = self.agent._parse_and_execute_step(step)
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(len(result["tool_calls"]), 3)
+        for call in result["tool_calls"]:
+            self.assertEqual(call["status"], "SUCCESS")
+        for name in ("chain_a.txt", "chain_b.txt", "chain_c.txt"):
+            self.assertTrue(os.path.exists(os.path.join(self.test_dir, name)))
+
+    def test_tool_chain_budget_enforced(self):
+        # Budget of 2: third call must be deferred with an explicit budget error.
+        self.agent.config.max_tool_calls_per_cycle = 2
+        self.agent.initialize_state()
+        step = (
+            '1. TOOL_CALL: file_writer_tool {"filepath": "b1.txt", "content": "1"} '
+            'TOOL_CALL: file_writer_tool {"filepath": "b2.txt", "content": "2"} '
+            'TOOL_CALL: file_writer_tool {"filepath": "b3.txt", "content": "3"}'
+        )
+        result = self.agent._parse_and_execute_step(step)
+        self.assertEqual(len(result["tool_calls"]), 2)
+        self.assertEqual(result["status"], "ERROR")
+        self.assertIn("budget", result["error"].lower())
+        self.assertFalse(os.path.exists(os.path.join(self.test_dir, "b3.txt")))
+
+    def test_working_memory_records_chain_outcomes(self):
+        self.agent.initialize_state()
+        step = '1. TOOL_CALL: file_writer_tool {"filepath": "wm.txt", "content": "payload"}'
+        result = self.agent._parse_and_execute_step(step)
+        summary = self.agent._summarize_tool_output(result)
+        self.assertIn("wm.txt", summary)
+        self.assertIn("file_writer_tool", summary)
+
+    def test_session_cookie_hydration_and_persistence(self):
+        self.bridge.save_short_term_state(
+            "hitl_agent",
+            ShortTermState(
+                run_id="run_sess",
+                current_state=AgentState.SLEEP.value,
+                cycle_count=5,
+                session_cookies={"sessionid": "abc123", "csrftoken": "xyz789"},
+            ),
+        )
+        self.agent.initialize_state()
+        # Hydrated from top-level Gist state on wake
+        self.assertEqual(self.agent.session_cookies["sessionid"], "abc123")
+        # Persisted back on save (top-level, not inside context_data)
+        self.agent.persist_current_state()
+        reloaded = self.bridge.load_short_term_state("hitl_agent")
+        self.assertEqual(reloaded.session_cookies["csrftoken"], "xyz789")
+        self.assertNotIn("session_cookies", reloaded.context_data)
+
+    def test_web_browser_injects_session_cookies(self):
+        from unittest.mock import patch
+        html_sample = "<html><body>Welcome back, member dashboard</body></html>"
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+            mock_resp.read.return_value = html_sample.encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_urlopen.return_value = mock_resp
+
+            self.agent.initialize_state()
+            self.agent.update_session_cookies({"sessionid": "topsecret", "locale": "en"})
+            result = self.agent._parse_and_execute_step(
+                '1. TOOL_CALL: web_browser_tool {"url": "https://member.example/dashboard"}'
+            )
+            self.assertEqual(result["tool_calls"][0]["status"], "SUCCESS")
+            request = mock_urlopen.call_args[0][0]
+            cookie_header = request.get_header("Cookie")
+            self.assertIsNotNone(cookie_header)
+            self.assertIn("sessionid=topsecret", cookie_header)
+            self.assertIn("locale=en", cookie_header)
+            # Redaction helper never exposes raw values in logs/proposals
+            redacted = self.agent._redacted_session_cookies()
+            self.assertNotIn("topsecret", json.dumps(redacted))
+            self.assertIn("sessionid", redacted)
+
+    def test_parse_cookie_string(self):
+        parsed = Toolbox.parse_cookie_string(
+            'sessionid=abc123; csrftoken="xyz 789"; Secure; HttpOnly; SameSite=Lax'
+        )
+        self.assertEqual(parsed["sessionid"], "abc123")
+        self.assertEqual(parsed["csrftoken"], "xyz 789")
+        self.assertNotIn("Secure", parsed)
+        self.assertEqual(Toolbox.parse_cookie_string(""), {})
 
 
 class TestNotificationManager(unittest.TestCase):

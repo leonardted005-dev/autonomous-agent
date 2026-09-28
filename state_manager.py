@@ -69,6 +69,7 @@ class AgentContext:
     payload: Dict[str, Any] = field(default_factory=dict)
     active_plan: List[str] = field(default_factory=list)
     execution_results: List[Dict[str, Any]] = field(default_factory=list)
+    working_memory: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     history: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -81,6 +82,7 @@ class AgentContext:
             "payload": self.payload,
             "active_plan": self.active_plan,
             "execution_results": self.execution_results,
+            "working_memory": self.working_memory,
             "errors": self.errors,
             "history": self.history,
         }
@@ -101,6 +103,7 @@ class AgentContext:
             payload=data.get("payload", {}),
             active_plan=data.get("active_plan", []),
             execution_results=data.get("execution_results", []),
+            working_memory=data.get("working_memory", []),
             errors=data.get("errors", []),
             history=data.get("history", []),
         )
@@ -181,13 +184,9 @@ class StateManager:
         return self.context.current_state
 
     def reset_for_new_cycle(self) -> None:
-        """Resets ephemeral plan and execution data while advancing cycle counter."""
+        """Resets ephemeral plan, execution data, and chained working memory."""
         self.context.cycle_count += 1
         self.context.active_plan.clear()
         self.context.execution_results.clear()
+        self.context.working_memory.clear()
         logger.info("Context reset for new cycle #%d", self.context.cycle_count)
-
-    to_state: AgentState
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    reason: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)

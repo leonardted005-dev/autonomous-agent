@@ -24,8 +24,14 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
      - `web_browser_tool(url)`: Fetches and cleans textual content from public RSS feeds, job boards, or websites via `urllib.request`.
      - `file_writer_tool(filepath, content)`: Writes scripts, portfolios, reports, or application files into the local workspace with directory traversal containment.
      - `http_poster_tool(url, payload)`: Sends HTTP POST requests to simulate external platform interactions, registrations, or work submissions.
-   - Implements a production-grade 4-provider `LLMClient` Fallback Priority Ledger (Groq -> Gemini -> Mistral -> OpenRouter). On HTTP 429/400-class errors or timeouts it prints "[WARNING] Active provider failed with error. Diverting prompt state to the next priority engine backup..." and replays the exact prompt against the next engine.
+   - Implements a production-grade 5-provider `LLMClient` Fallback Priority Ledger (Groq -> Gemini -> Mistral -> OpenRouter -> xKiro). On HTTP 429/400-class errors or timeouts it prints "[WARNING] Active provider failed with error. Diverting prompt state to the next priority engine backup..." and replays the exact prompt against the next engine.
    - Instructs the agent with an open-ended discovery objective: analyze long-term memory, choose lucrative or educational digital tasks, execute tools dynamically, and log successes/failures for continuous self-improvement.
+
+### Advanced Autonomy Features
+
+- **Account Wall Routing Gate** — when the agent finds a high-value platform (Upwork, Freelancer, GitHub Sponsors, etc.) that demands registration, sign-up, login, or verification, it is forbidden from skipping it. It halts and raises an **Account Creation & Verification** proposal (`requires_account`, `registration_link`, `session_active`) so the human can approve it on the dashboard instead of the opportunity being silently dropped.
+- **Multi-Step Tool Chaining (batch processing)** — a single 10-minute run now executes an internal tool chain: each step runs, its output is appended to the FSM `working_memory`, and the next link processes with that context. Bounded by `MAX_TOOL_CALLS_PER_CYCLE` (default **5**) so nothing can loop forever; the EVALUATE phase receives the chain summary before the agent enters `SLEEP`.
+- **Invisible Cookie-Session Handshake** — `web_browser_tool` automatically injects an optional `session_cookies` map (top-level in the Gist state) as a standard `Cookie:` request header. The human signs in on their own machine, pastes the cookie string into the dashboard, and the agent wakes up already authenticated — it never receives a password. Values are redacted in logs/proposals.
 
 
 4. **`cloud_memory_bridge.py`**:
@@ -39,6 +45,7 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
 |---|---|---|
 | `AGENT_ID` | `default_stateless_agent` | Identifier for the agent instance. |
 | `MAX_STEPS_PER_RUN` | `5` | Maximum atomic steps allowed per invocation. |
+| `MAX_TOOL_CALLS_PER_CYCLE` | `5` | Safety bound on chained `TOOL_CALL` links executed inside one cloud run. |
 | `LLM_PROVIDER` | `openai` | LLM provider (`openai`, `groq`, `anthropic`). |
 | `LLM_MODEL` | `gpt-4o-mini` | Target completion model name. |
 | `LLM_API_BASE` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |
@@ -62,7 +69,7 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
 
 When the agent detects a task that touches external platforms, money movement, or asset publishing, it pauses for your approval:
 
-1. The FSM enters `PENDING_APPROVAL` and persists a `pending_proposal` JSON dictionary inside the Gist state with: `task_id`, `type` (Freelance Pitch / Code Asset Sale / Trend Report), `target_platform`, `proposed_action`, `generated_files`, and `estimated_revenue`.
+1. The FSM enters `PENDING_APPROVAL` and persists a `pending_proposal` JSON dictionary inside the Gist state with: `task_id`, `type` (Freelance Pitch / Code Asset Sale / Trend Report / Account Creation & Verification), `target_platform`, `proposed_action`, `generated_files`, and `estimated_revenue`. Account-wall proposals additionally carry `requires_account`, `registration_link`, and `session_active`.
 2. The moment the proposal is created, the zero-dependency `NotificationManager` fires instant alerts (before any SLEEP phase):
    - **Discord** (`DISCORD_WEBHOOK_URL`): an embedded approval card with Task ID, Platform, Estimated Revenue, and a direct Vercel Dashboard link (`DASHBOARD_URL`, default `https://autonomous-agent.vercel.app`).
    - **Email** (`SMTP_SERVER`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, optional `NOTIFY_EMAIL`): a summary alert that a task awaits review (uses `smtplib`, STARTTLS on 587 / SSL on 465).
@@ -90,6 +97,7 @@ The gateway UI lives in a single self-contained file: **`index.html`** (Tailwind
 - **Lockable credentials panel** — `GIST_ID`, `GIT_TOKEN`, and optional `AGENT_ID` are stored exclusively in the browser's `localStorage` (never sent anywhere except `api.github.com`).
 - **Proposal render engine** — uses the GitHub Gists REST API (`GET /gists/{id}`, `PATCH /gists/{id}`) with `async/await`; when the agent state is `PENDING_APPROVAL` a prominent alert card shows Task ID, platform, proposed action, generated-file code previews, and expected revenue.
 - **1-button controls** — `🟢 APPROVE TASK` / `🔴 DENY TASK` patch `context_data.human_decision` (`APPROVED` / `DENIED`) in the Gist and confirm that the cloud runner will act on the next 30-minute cron cycle.
+- **Injected Cookie String field** — an optional textarea in the proposal card. Sign into the platform on your own PC, copy the `Cookie:` header from DevTools → Network, paste it in, and press **APPROVE**: the dashboard parses `name=value` pairs (attribute tokens like `Secure`/`HttpOnly` are skipped) and writes them to the top-level `session_cookies` of the Gist state, so the agent wakes up already logged in and never sees a password. A 🍪 badge shows how many cookies are active (names only).
 
 ### Deploy to Vercel (free)
 ```bash

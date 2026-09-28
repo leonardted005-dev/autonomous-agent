@@ -31,6 +31,7 @@ class ShortTermState:
     cycle_count: int = 0
     active_plan: List[str] = field(default_factory=list)
     context_data: Dict[str, Any] = field(default_factory=dict)
+    session_cookies: Dict[str, str] = field(default_factory=dict)
     last_updated: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
@@ -40,17 +41,21 @@ class ShortTermState:
             "cycle_count": self.cycle_count,
             "active_plan": self.active_plan,
             "context_data": self.context_data,
+            "session_cookies": self.session_cookies,
             "last_updated": self.last_updated,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> ShortTermState:
+        raw_cookies = data.get("session_cookies", {})
+        cookies = {str(k): str(v) for k, v in raw_cookies.items()} if isinstance(raw_cookies, dict) else {}
         return cls(
             run_id=data.get("run_id", "default_run"),
             current_state=data.get("current_state", "WAKE_UP"),
             cycle_count=data.get("cycle_count", 0),
             active_plan=data.get("active_plan", []),
             context_data=data.get("context_data", {}),
+            session_cookies=cookies,
             last_updated=data.get("last_updated", datetime.now(timezone.utc).isoformat()),
         )
 
