@@ -425,7 +425,7 @@ class NotificationManager:
     human reviewer can act before the next lifecycle phase.
     """
 
-    DEFAULT_DASHBOARD_URL = "https://autonomous-agent.vercel.app"
+    DEFAULT_DASHBOARD_URL = "https://autonomous-agent-gateway.vercel.app"
 
     def __init__(self, dashboard_url: Optional[str] = None) -> None:
         self.dashboard_url = dashboard_url or os.getenv("DASHBOARD_URL", self.DEFAULT_DASHBOARD_URL)

@@ -1,7 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
-*$py.class
+*.class
 
 # Local agent memory (stateless runner persistent directory)
 .agent_memory/
@@ -10,7 +10,8 @@ __pycache__/
 autonomous_discovery.txt
 human_action_needed.json
 
-# Environment variables
+# Vercel local project link and env files
+.vercel/
 .env
 .env.*
 *.env

@@ -1,0 +1,12 @@
+# Vercel static deployment exclusions (backend code is not part of the public dashboard)
+.agent_memory/
+.vercel/
+.github/
+__pycache__/
+*.py
+*.pyc
+*.pyo
+*.jsonl
+*.md
+test_framework.py
+dashboard_smoke_test.js

@@ -55,7 +55,7 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
 | `SMTP_SERVER` / `SMTP_PORT` | `None` / `587` | SMTP endpoint for email alerts (STARTTLS; port 465 uses SSL). |
 | `SMTP_USER` / `SMTP_PASSWORD` | `None` | SMTP credentials used to send the approval summary email. |
 | `NOTIFY_EMAIL` | falls back to `SMTP_USER` | Recipient address for approval emails. |
-| `DASHBOARD_URL` | `https://autonomous-agent.vercel.app` | Vercel Dashboard link embedded in Discord/email alerts. |
+| `DASHBOARD_URL` | `https://autonomous-agent-gateway.vercel.app` | Vercel Dashboard link embedded in Discord/email alerts. |
 
 
 ## Human-in-the-Loop Dashboard Gateway
@@ -74,7 +74,16 @@ When the agent detects a task that touches external platforms, money movement, o
 
 ## Human-in-the-Loop Dashboard (Vercel)
 
+**Live dashboard: https://autonomous-agent-gateway.vercel.app**
+
 The gateway UI lives in a single self-contained file: **`index.html`** (Tailwind CSS via CDN + vanilla JS, zero build step).
+
+### Deployment layout
+- `index.html` — the dashboard (served as the static root).
+- `vercel.json` — static project config (`framework: null`, no build command, `outputDirectory: "."`).
+- `.vercelignore` — keeps backend Python, `.agent_memory/`, and docs out of the public deployment.
+- Vercel project: `steven-songwe-s-projects/autonomous-agent-gateway` (linked + connected to this GitHub repo, so every push to `main` can be redeployed).
+
 
 ### Features
 - **Command center UI** — dark responsive layout with an active agent connection card, a live lifecycle tracker (`WAKE_UP → PLAN → EXECUTE → PENDING_APPROVAL → EVALUATE → SLEEP`), and a metrics panel (Cycle Count, Est. Revenue, Task Type, Target Platform).
@@ -94,7 +103,7 @@ vercel --prod
 # (static site: no build command, no output directory needed)
 ```
 
-Open the deployed URL, click **Settings**, paste your `GIST_ID` and a GitHub token with `gist` scope, then press **Save Credentials**. The dashboard polls the Gist every 60 seconds.
+Open the deployed URL (**https://autonomous-agent-gateway.vercel.app**), click **Settings**, paste your `GIST_ID` and a GitHub token with `gist` scope, then press **Save Credentials**. The dashboard polls the Gist every 60 seconds.
 
 ### Dashboard regression test
 ```bash
