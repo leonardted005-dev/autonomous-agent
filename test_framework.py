@@ -108,6 +108,64 @@ class TestAutonomousAgentCore(unittest.TestCase):
         self.assertIn("ACTION", event_types)
 
 
+class TestLLMFailover(unittest.TestCase):
+    def test_ledger_registers_four_providers(self):
+        from agent_core import LLMClient
+        ledger = LLMClient.FALLBACK_PRIORITY_LEDGER
+        self.assertEqual(len(ledger), 4)
+        self.assertEqual([p["name"] for p in ledger], ["groq", "gemini", "mistral", "openrouter"])
+        self.assertEqual(ledger[0]["model"], "qwen/qwen3.8-27b")
+        self.assertEqual(ledger[1]["model"], "gemini-1.5-flash")
+        self.assertEqual(ledger[2]["model"], "mistral-small-latest")
+        self.assertEqual(ledger[3]["model"], "openrouter/free")
+
+    def test_chain_skips_providers_without_keys(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ["GROQ_API_KEY"] = "gsk_test"
+            client = LLMClient(AgentConfig())
+            chain = client._resolve_provider_chain()
+            self.assertEqual(len(chain), 1)
+            self.assertEqual(chain[0]["name"], "groq")
+
+    def test_failover_on_429_diverts_to_next_provider(self):
+        import io
+        import urllib.error
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"GROQ_API_KEY": "gsk_a", "GEMINI_API_KEY": "gm_b"}, clear=False):
+            client = LLMClient(AgentConfig())
+            calls = []
+
+            def fake_post(api_base, model, key, messages, temp):
+                calls.append((api_base, model))
+                if len(calls) == 1:
+                    raise urllib.error.HTTPError("http://x", 429, "Too Many Requests", {}, io.BytesIO(b"rate limited"))
+                return "recovered via gemini"
+
+            with patch.object(client, "_post_chat_completion", side_effect=fake_post):
+                result = client.generate_completion([{"role": "user", "content": "hello"}])
+                self.assertEqual(result, "recovered via gemini")
+                self.assertEqual(len(calls), 2)
+                self.assertIn("groq", calls[0][0])
+                self.assertIn("googleapis", calls[1][0])
+
+    def test_all_providers_exhausted_uses_heuristic(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"GROQ_API_KEY": "gsk_a", "GEMINI_API_KEY": "gm_b"}, clear=False):
+            client = LLMClient(AgentConfig())
+            with patch.object(client, "_post_chat_completion", side_effect=TimeoutError("timed out")):
+                try:
+                    client.generate_completion([{"role": "user", "content": "hello"}])
+                    self.fail("Expected TimeoutError when a single provider is exhausted")
+                except TimeoutError:
+                    pass
+            # No keys at all -> offline heuristic path
+            with patch.dict(os.environ, {}, clear=True):
+                offline = LLMClient(AgentConfig())
+                result = offline.generate_completion([{"role": "user", "content": "hello"}])
+                self.assertIn("THINKING PROCESS", result)
+
+
 class TestToolbox(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()

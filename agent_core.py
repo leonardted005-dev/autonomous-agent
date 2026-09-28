@@ -271,61 +271,130 @@ class LLMClient:
     """
     Pure Python standard library (urllib) client for invoking AI model endpoints.
     Eliminates heavy external SDK dependencies to keep cloud runners lightweight.
+
+    Production-grade multi-provider failover chain (Fallback Priority Ledger):
+      Priority 1: Groq       (GROQ_API_KEY,       api.groq.com, qwen/qwen3.8-27b)
+      Priority 2: Gemini     (GEMINI_API_KEY,     googleapis.com, gemini-1.5-flash)
+      Priority 3: Mistral    (MISTRAL_API_KEY,    mistral.ai, mistral-small-latest)
+      Priority 4: OpenRouter (OPENROUTER_API_KEY, openrouter.ai, openrouter/free)
     """
+
+    # Fallback Priority Ledger: ordered provider chain for rate-limit resilience.
+    FALLBACK_PRIORITY_LEDGER: List[Dict[str, str]] = [
+        {"name": "groq", "api_base": "https://api.groq.com/openai/v1", "model": "qwen/qwen3.8-27b", "key_env": "GROQ_API_KEY"},
+        {"name": "gemini", "api_base": "https://generativelanguage.googleapis.com/v1beta/openai", "model": "gemini-1.5-flash", "key_env": "GEMINI_API_KEY"},
+        {"name": "mistral", "api_base": "https://api.mistral.ai/v1", "model": "mistral-small-latest", "key_env": "MISTRAL_API_KEY"},
+        {"name": "openrouter", "api_base": "https://openrouter.ai/api/v1", "model": "openrouter/free", "key_env": "OPENROUTER_API_KEY"},
+    ]
+
+    # HTTP statuses that trigger failover to the next priority provider.
+    RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 408, 409, 422, 429, 500, 502, 503, 504}
 
     def __init__(self, config: AgentConfig) -> None:
         self.config = config
-        self.api_key = self._resolve_api_key()
+        self.api_key = self._resolve_legacy_api_key()
 
-    def _resolve_api_key(self) -> Optional[str]:
+    def _resolve_legacy_api_key(self) -> Optional[str]:
         if self.config.llm_provider == "groq":
             return os.getenv("GROQ_API_KEY")
         elif self.config.llm_provider == "anthropic":
             return os.getenv("ANTHROPIC_API_KEY")
         return os.getenv("OPENAI_API_KEY")
 
+    def _resolve_api_key(self) -> Optional[str]:
+        """Backward-compatible alias for legacy single-key resolution."""
+        return self._resolve_legacy_api_key()
+
+    def _resolve_provider_chain(self) -> List[Dict[str, str]]:
+        """
+        Builds the active failover chain from the Fallback Priority Ledger.
+        Providers without configured keys are skipped.
+        """
+        chain: List[Dict[str, str]] = []
+        seen = set()
+        preferred = self.config.llm_provider.lower()
+
+        for entry in self.FALLBACK_PRIORITY_LEDGER:
+            if entry["name"] == preferred and os.getenv(entry["key_env"]):
+                key = str(os.getenv(entry["key_env"])).strip()
+                chain.append({"name": entry["name"], "api_base": entry["api_base"], "model": entry["model"], "key": key, "key_env": entry["key_env"]})
+                seen.add(entry["name"])
+                break
+
+        if preferred in ("openai", "anthropic") and self.api_key:
+            chain.append({"name": preferred, "api_base": self.config.llm_api_base, "model": self.config.llm_model, "key": str(self.api_key).strip(), "key_env": "OPENAI_API_KEY"})
+            seen.add(preferred)
+
+        for entry in self.FALLBACK_PRIORITY_LEDGER:
+            if entry["name"] in seen:
+                continue
+            key = os.getenv(entry["key_env"])
+            if not key:
+                continue
+            model = os.getenv(entry["name"].upper() + "_MODEL", entry["model"])
+            chain.append({"name": entry["name"], "api_base": entry["api_base"], "model": model, "key": str(key).strip(), "key_env": entry["key_env"]})
+
+        if not chain and self.api_key:
+            chain.append({"name": preferred, "api_base": self.config.llm_api_base, "model": self.config.llm_model, "key": str(self.api_key).strip(), "key_env": "LLM_API_KEY"})
+
+        return chain
+
+    def _post_chat_completion(self, api_base: str, model: str, api_key: str, messages: List[Dict[str, str]], temperature: float) -> str:
+        """Executes a single OpenAI-compatible chat completion POST request."""
+        endpoint = f"{api_base.rstrip('/')}/chat/completions"
+        payload = {"model": model, "messages": messages, "temperature": temperature}
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key.strip()}",
+            "User-Agent": "StatelessAgentCore/1.0",
+            "HTTP-Referer": "https://github.com/leonardted005-dev/autonomous-agent",
+            "X-Title": "AutonomousAgent",
+        }
+        req = urllib.request.Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=self.config.request_timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data["choices"][0]["message"]["content"]
+
     def generate_completion(self, messages: List[Dict[str, str]], temperature: float = 0.2) -> str:
         """
-        Invokes OpenAI-compatible chat completion endpoint.
-        Returns generated text or a deterministic fallback if API keys are missing or offline.
+        Invokes chat completion across the Fallback Priority Ledger.
+        On HTTP 429/400-class errors or network timeouts, diverts the exact
+        same prompt state to the next priority engine backup.
         """
-        if not self.api_key:
+        chain = self._resolve_provider_chain()
+        if not chain:
             logger.warning(
                 "No API key detected for provider '%s'. Simulating heuristic response for offline runner mode.",
                 self.config.llm_provider,
             )
             return self._heuristic_fallback(messages)
 
-        endpoint = f"{self.config.llm_api_base.rstrip('/')}/chat/completions"
-        payload = {
-            "model": self.config.llm_model,
-            "messages": messages,
-            "temperature": temperature,
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-            "User-Agent": "StatelessAgentCore/1.0",
-        }
+        last_error: Optional[Exception] = None
+        for index, provider in enumerate(chain):
+            label = provider["name"] + " (" + provider["model"] + " @ " + provider["api_base"] + ")"
+            try:
+                logger.info("LLM attempt %d/%d via %s", index + 1, len(chain), label)
+                return self._post_chat_completion(provider["api_base"], provider["model"], provider["key"], messages, temperature)
+            except urllib.error.HTTPError as http_err:
+                error_body = http_err.read().decode("utf-8", errors="replace")
+                logger.error("LLM HTTP error %d via %s: %s", http_err.code, label, error_body)
+                last_error = RuntimeError("LLM API returned HTTP " + str(http_err.code) + " via " + label + ": " + error_body)
+                if http_err.code in self.RETRYABLE_STATUS_CODES and index < len(chain) - 1:
+                    print("[WARNING] Active provider failed with error. Diverting prompt state to the next priority engine backup...")
+                    logger.warning("Failing over from %s to next priority provider.", label)
+                    continue
+                raise last_error from http_err
+            except Exception as e:
+                logger.error("LLM request failed via %s: %s", label, e)
+                last_error = e
+                if index < len(chain) - 1:
+                    print("[WARNING] Active provider failed with error. Diverting prompt state to the next priority engine backup...")
+                    logger.warning("Failing over from %s to next priority provider.", label)
+                    continue
+                raise
 
-        req = urllib.request.Request(
-            endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=self.config.request_timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return data["choices"][0]["message"]["content"]
-        except urllib.error.HTTPError as http_err:
-            error_body = http_err.read().decode("utf-8", errors="replace")
-            logger.error("LLM HTTP error %d: %s", http_err.code, error_body)
-            raise RuntimeError(f"LLM API returned HTTP {http_err.code}: {error_body}") from http_err
-        except Exception as e:
-            logger.error("LLM request failed: %s", e)
-            raise
+        logger.error("All LLM providers exhausted; using offline heuristic. Last error: %s", last_error)
+        return self._heuristic_fallback(messages)
 
     def _heuristic_fallback(self, messages: List[Dict[str, str]]) -> str:
         """Provides predictable structured responses when no API credentials are provided."""
