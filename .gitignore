@@ -6,6 +6,10 @@ __pycache__/
 # Local agent memory (stateless runner persistent directory)
 .agent_memory/
 
+# Agent-generated workspace artifacts
+autonomous_discovery.txt
+human_action_needed.json
+
 # Environment variables
 .env
 .env.*
