@@ -55,7 +55,7 @@ class AgentConfig:
     ).lower()
     llm_model: str = os.getenv(
         "LLM_MODEL",
-        "qwen-2.5-coder-32b" if os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY") else "gpt-4o-mini"
+        "qwen/qwen3.8-27b" if os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY") else "gpt-4o-mini"
     )
     llm_api_base: str = os.getenv(
         "LLM_API_BASE",
