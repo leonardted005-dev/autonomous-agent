@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import smtplib
 import sys
 import traceback
 import urllib.error
@@ -30,6 +31,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -416,6 +418,146 @@ class LLMClient:
         )
 
 
+class NotificationManager:
+    """
+    Zero-dependency notification layer (stdlib urllib.request + smtplib).
+    Fires instant alerts the moment a proposal enters PENDING_APPROVAL so the
+    human reviewer can act before the next lifecycle phase.
+    """
+
+    DEFAULT_DASHBOARD_URL = "https://autonomous-agent.vercel.app"
+
+    def __init__(self, dashboard_url: Optional[str] = None) -> None:
+        self.dashboard_url = dashboard_url or os.getenv("DASHBOARD_URL", self.DEFAULT_DASHBOARD_URL)
+
+    # ------------------------------------------------------------------
+    # Aggregator
+    # ------------------------------------------------------------------
+    def send_alerts(self, proposal_json: Dict[str, Any]) -> None:
+        """Dispatches all configured alerts. Never raises into the agent loop."""
+        self.send_discord_alert(proposal_json)
+        self.send_email_alert(proposal_json)
+
+    # ------------------------------------------------------------------
+    # 1. Discord Webhook alert
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _field(value: Any, fallback: str = "TBD") -> str:
+        """Guarantees a non-empty, size-safe Discord embed field value."""
+        text = str(value).strip() if value is not None else ""
+        if not text:
+            text = fallback
+        return text[:1024]
+
+    def send_discord_alert(self, proposal_json: Dict[str, Any]) -> bool:
+        """
+        Posts an embedded approval card to DISCORD_WEBHOOK_URL with Task ID,
+        Platform, Estimated Revenue, and a direct Vercel Dashboard link.
+        """
+        webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+        if not webhook_url:
+            logger.debug("DISCORD_WEBHOOK_URL not configured; skipping Discord alert.")
+            return False
+
+        task_id = proposal_json.get("task_id", "N/A")
+        embed = {
+            "title": "New Task Awaiting Your Approval",
+            "description": self._field(proposal_json.get("type"), "Task") + " requires human review before execution.",
+            "color": 0xFFC107,  # Amber warning
+            "fields": [
+                {"name": "Task ID", "value": self._field(task_id), "inline": True},
+                {"name": "Platform", "value": self._field(proposal_json.get("target_platform")), "inline": True},
+                {"name": "Estimated Revenue", "value": self._field(proposal_json.get("estimated_revenue")), "inline": True},
+                {"name": "Proposed Action", "value": self._field(proposal_json.get("proposed_action"))[:1024], "inline": False},
+                {
+                    "name": "Vercel Dashboard",
+                    "value": "[Review & Approve](" + self.dashboard_url + ")",
+                    "inline": False,
+                },
+            ],
+            "footer": {"text": "Autonomous Agent - Human-in-the-Loop Gateway"},
+            "timestamp": proposal_json.get("created_at") or datetime.now(timezone.utc).isoformat(),
+        }
+        payload = {"username": "AutonomousAgent", "content": "Approval required: task " + str(task_id), "embeds": [embed]}
+        req = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "StatelessAgentCore/1.0"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                ok = getattr(resp, "status", 200) in (200, 204)
+            logger.info("Discord alert dispatched for task %s (status ok=%s)", task_id, ok)
+            return ok
+        except Exception as e:
+            logger.warning("Discord alert failed for task %s: %s", task_id, e)
+            return False
+
+    # ------------------------------------------------------------------
+    # 2. Email alert (SMTP)
+    # ------------------------------------------------------------------
+    def send_email_alert(self, proposal_json: Dict[str, Any]) -> bool:
+        """
+        Fires a summary email via SMTP_SERVER/SMTP_PORT/SMTP_USER/SMTP_PASSWORD
+        telling the user a task is awaiting their review.
+        """
+        server = os.getenv("SMTP_SERVER")
+        user = os.getenv("SMTP_USER")
+        password = os.getenv("SMTP_PASSWORD")
+        if not (server and user and password):
+            logger.debug("SMTP credentials not configured; skipping email alert.")
+            return False
+
+        try:
+            port = int(os.getenv("SMTP_PORT", "587"))
+        except ValueError:
+            logger.warning("Invalid SMTP_PORT '%s'; skipping email alert.", os.getenv("SMTP_PORT"))
+            return False
+
+        recipient = os.getenv("NOTIFY_EMAIL", user)
+        task_id = proposal_json.get("task_id", "N/A")
+        subject = "[Autonomous Agent] Task %s awaiting your approval" % task_id
+        body = (
+            "A new task proposal has entered PENDING_APPROVAL and needs your review.\n\n"
+            "Task ID:            %s\n"
+            "Type:               %s\n"
+            "Target Platform:    %s\n"
+            "Estimated Revenue:  %s\n"
+            "Proposed Action:    %s\n\n"
+            "Review & decide here: %s\n"
+            "Set human_decision to APPROVED or DENIED in the Gist state to proceed.\n"
+        ) % (
+            task_id,
+            proposal_json.get("type", "N/A"),
+            proposal_json.get("target_platform", "TBD"),
+            proposal_json.get("estimated_revenue", "TBD"),
+            str(proposal_json.get("proposed_action", "N/A"))[:500],
+            self.dashboard_url,
+        )
+
+        msg = EmailMessage()
+        msg["From"] = user
+        msg["To"] = recipient
+        msg["Subject"] = subject
+        msg.set_content(body)
+
+        try:
+            if port == 465:
+                with smtplib.SMTP_SSL(server, port, timeout=15) as smtp:
+                    smtp.login(user, password)
+                    smtp.send_message(msg)
+            else:
+                with smtplib.SMTP(server, port, timeout=15) as smtp:
+                    smtp.starttls()
+                    smtp.login(user, password)
+                    smtp.send_message(msg)
+            logger.info("Email alert dispatched for task %s to %s", task_id, recipient)
+            return True
+        except Exception as e:
+            logger.warning("Email alert failed for task %s: %s", task_id, e)
+            return False
+
 
 class AutonomousAgent:
     """
@@ -428,11 +570,13 @@ class AutonomousAgent:
         config: Optional[AgentConfig] = None,
         memory_bridge: Optional[BaseMemoryBridge] = None,
         toolbox: Optional[Toolbox] = None,
+        notifier: Optional[NotificationManager] = None,
     ) -> None:
         self.config = config or AgentConfig()
         self.memory = memory_bridge or create_memory_bridge(self.config)
         self.llm = LLMClient(self.config)
         self.toolbox = toolbox or Toolbox()
+        self.notifier = notifier or NotificationManager()
         self.state_manager: Optional[StateManager] = None
         # Human-in-the-loop gate bookkeeping (hydrated from persisted state)
         self._resume_state: Optional[str] = None
@@ -789,11 +933,13 @@ class AutonomousAgent:
 
                 # PLAN-phase Human-in-the-Loop detection
                 if self._requires_human_approval(monologue):
-                    self._enter_pending_approval(monologue, "PLAN")
+                    proposal = self._enter_pending_approval(monologue, "PLAN")
                     self.state_manager.transition_to(
                         AgentState.PENDING_APPROVAL,
                         reason="Plan involves external platform, financial transaction, or asset publishing",
                     )
+                    # Instant alerts BEFORE any subsequent SLEEP phase
+                    self.notifier.send_alerts(proposal)
                     self.persist_current_state()
                     logger.info("Cycle halted in PENDING_APPROVAL state awaiting dashboard review.")
                     return
@@ -836,11 +982,13 @@ class AutonomousAgent:
 
             # EXECUTE-phase Human-in-the-Loop detection
             if triggered_step is not None:
-                self._enter_pending_approval(triggered_step, "EXECUTE")
+                proposal = self._enter_pending_approval(triggered_step, "EXECUTE")
                 self.state_manager.transition_to(
                     AgentState.PENDING_APPROVAL,
                     reason="Execution step involves external platform, financial transaction, or asset publishing",
                 )
+                # Instant alerts BEFORE any subsequent SLEEP phase
+                self.notifier.send_alerts(proposal)
                 self.persist_current_state()
                 logger.info("Cycle halted in PENDING_APPROVAL state awaiting dashboard review.")
                 return

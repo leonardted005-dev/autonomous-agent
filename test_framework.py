@@ -291,6 +291,112 @@ class TestHumanInTheLoop(unittest.TestCase):
         self.assertFalse(self.agent._requires_human_approval("Inspect local workspace files and summarize logs"))
 
 
+class TestNotificationManager(unittest.TestCase):
+    PROPOSAL = {
+        "task_id": "deadbeef0001",
+        "type": "Freelance Pitch",
+        "target_platform": "Upwork",
+        "proposed_action": "Submit pitch collecting payment",
+        "generated_files": [],
+        "estimated_revenue": "$250",
+    }
+
+    def test_discord_alert_posts_embed(self):
+        from unittest.mock import MagicMock, patch
+        from agent_core import NotificationManager
+        notifier = NotificationManager()
+        with patch.dict(os.environ, {"DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1/x"}):
+            with patch("urllib.request.urlopen") as mock_urlopen:
+                mock_resp = MagicMock()
+                mock_resp.status = 204
+                mock_resp.__enter__.return_value = mock_resp
+                mock_urlopen.return_value = mock_resp
+
+                result = notifier.send_discord_alert(self.PROPOSAL)
+
+                self.assertTrue(result)
+                mock_urlopen.assert_called_once()
+                request = mock_urlopen.call_args[0][0]
+                body = json.loads(request.data.decode("utf-8"))
+                embed = body["embeds"][0]
+                field_values = [f["value"] for f in embed["fields"]]
+                self.assertIn("deadbeef0001", field_values)
+                self.assertIn("Upwork", field_values)
+                self.assertIn("$250", field_values)
+                self.assertTrue(any(notifier.dashboard_url in v for v in field_values))
+
+    def test_discord_alert_skipped_without_env(self):
+        from unittest.mock import patch
+        from agent_core import NotificationManager
+        notifier = NotificationManager()
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("urllib.request.urlopen") as mock_urlopen:
+                self.assertFalse(notifier.send_discord_alert(self.PROPOSAL))
+                mock_urlopen.assert_not_called()
+
+    def test_email_alert_sent_via_smtp(self):
+        from unittest.mock import MagicMock, patch
+        from agent_core import NotificationManager
+        notifier = NotificationManager()
+        env = {
+            "SMTP_SERVER": "smtp.example.com",
+            "SMTP_PORT": "587",
+            "SMTP_USER": "bot@example.com",
+            "SMTP_PASSWORD": "secret",
+        }
+        with patch.dict(os.environ, env):
+            with patch("smtplib.SMTP") as mock_smtp:
+                instance = MagicMock()
+                mock_smtp.return_value.__enter__.return_value = instance
+
+                result = notifier.send_email_alert(self.PROPOSAL)
+
+                self.assertTrue(result)
+                instance.starttls.assert_called_once()
+                instance.login.assert_called_once_with("bot@example.com", "secret")
+                instance.send_message.assert_called_once()
+                sent = instance.send_message.call_args[0][0]
+                self.assertIn("deadbeef0001", sent["Subject"])
+                self.assertIn("deadbeef0001", sent.get_content())
+
+    def test_email_alert_skipped_without_env(self):
+        from unittest.mock import patch
+        from agent_core import NotificationManager
+        notifier = NotificationManager()
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("smtplib.SMTP") as mock_smtp:
+                self.assertFalse(notifier.send_email_alert(self.PROPOSAL))
+                mock_smtp.assert_not_called()
+
+    def test_alerts_fire_when_entering_pending_approval(self):
+        from unittest.mock import MagicMock, patch
+        bridge = LocalFileMemoryBridge(storage_dir=tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, bridge.storage_dir, True)
+        config = AgentConfig(agent_id="notify_agent", max_steps_per_run=3)
+        agent = AutonomousAgent(config=config, memory_bridge=bridge)
+        agent.notifier = MagicMock()
+
+        # Force a PLAN-phase approval trigger (external platform + payment)
+        agent.generate_monologue = lambda prompt: (
+            "THINKING PROCESS:\n- Marketplace opportunity detected.\n"
+            "STEP-BY-STEP PLAN:\n"
+            "1. Submit freelance pitch to Upwork requesting $300 payment\n"
+            "2. Track listing status\n"
+            "3. Transition to evaluation\n"
+            "EXECUTION ASSESSMENT:\nReady for review."
+        )
+        agent.run_cycle()
+
+        agent.notifier.send_alerts.assert_called_once()
+        sent_proposal = agent.notifier.send_alerts.call_args[0][0]
+        self.assertIn("task_id", sent_proposal)
+        self.assertEqual(sent_proposal["detected_in_phase"], "PLAN")
+
+        persisted = bridge.load_short_term_state("notify_agent")
+        self.assertEqual(persisted.current_state, AgentState.PENDING_APPROVAL.value)
+        self.assertIn("pending_proposal", persisted.context_data)
+
+
 class TestToolbox(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()

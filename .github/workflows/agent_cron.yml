@@ -37,5 +37,12 @@ jobs:
           XKIRO_API_KEY: ${{ secrets.XKIRO_API_KEY }}
           CUSTOM_GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
         run: |
           python agent_core.py

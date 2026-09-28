@@ -51,6 +51,11 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
 | `MISTRAL_API_KEY` | `None` | Priority 3 Mistral key (model `mistral-small-latest` @ `https://api.mistral.ai/v1`). |
 | `OPENROUTER_API_KEY` | `None` | Priority 4 OpenRouter key (model `openrouter/free` @ `https://openrouter.ai/api/v1`). |
 | `XKIRO_API_KEY` | `None` | Priority 5 xKiro backup key (open-weights model `qwen/qwen3-32b` @ `https://api.xkiro.com/v1`). |
+| `DISCORD_WEBHOOK_URL` | `None` | Discord webhook that receives an embedded approval card when a proposal enters `PENDING_APPROVAL`. |
+| `SMTP_SERVER` / `SMTP_PORT` | `None` / `587` | SMTP endpoint for email alerts (STARTTLS; port 465 uses SSL). |
+| `SMTP_USER` / `SMTP_PASSWORD` | `None` | SMTP credentials used to send the approval summary email. |
+| `NOTIFY_EMAIL` | falls back to `SMTP_USER` | Recipient address for approval emails. |
+| `DASHBOARD_URL` | `https://autonomous-agent.vercel.app` | Vercel Dashboard link embedded in Discord/email alerts. |
 
 
 ## Human-in-the-Loop Dashboard Gateway
@@ -58,11 +63,14 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
 When the agent detects a task that touches external platforms, money movement, or asset publishing, it pauses for your approval:
 
 1. The FSM enters `PENDING_APPROVAL` and persists a `pending_proposal` JSON dictionary inside the Gist state with: `task_id`, `type` (Freelance Pitch / Code Asset Sale / Trend Report), `target_platform`, `proposed_action`, `generated_files`, and `estimated_revenue`.
-2. On the next wake-up the agent reads `human_decision` from the persisted state:
+2. The moment the proposal is created, the zero-dependency `NotificationManager` fires instant alerts (before any SLEEP phase):
+   - **Discord** (`DISCORD_WEBHOOK_URL`): an embedded approval card with Task ID, Platform, Estimated Revenue, and a direct Vercel Dashboard link (`DASHBOARD_URL`, default `https://autonomous-agent.vercel.app`).
+   - **Email** (`SMTP_SERVER`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, optional `NOTIFY_EMAIL`): a summary alert that a task awaits review (uses `smtplib`, STARTTLS on 587 / SSL on 465).
+3. On the next wake-up the agent reads `human_decision` from the persisted state:
    - `null` $\rightarrow$ immediately `SLEEP` without executing (waiting for you).
    - `"APPROVED"` $\rightarrow$ proceeds to the execution block with the stored plan.
    - `"DENIED"` $\rightarrow$ clears the task and returns to planning.
-3. To decide, edit your Gist state JSON and set `human_decision` inside `context_data` to `APPROVED` or `DENIED`.
+4. To decide, edit your Gist state JSON and set `human_decision` inside `context_data` to `APPROVED` or `DENIED`.
 
 ## Running the Agent
 
@@ -101,6 +109,9 @@ To enable cloud autonomy, configure your secrets in GitHub:
 | `XKIRO_API_KEY` | Your xKiro key from [xkiro.com](https://xkiro.com) (Priority 5 backup, OpenAI-compatible `https://api.xkiro.com/v1`). |
 | `GIST_ID` | The 32-character ID of your private GitHub Gist created to store agent memory (e.g. from `https://gist.github.com/username/<GIST_ID>`). |
 | `GIT_TOKEN` (mapped to `CUSTOM_GIT_TOKEN`) | A GitHub Personal Access Token (classic with `gist` scope or fine-grained token with Gist read/write permission) so the runner can update the Gist. Stored as `GIT_TOKEN` secret, injected as `CUSTOM_GIT_TOKEN` env var to avoid collision with Actions' reserved `GITHUB_TOKEN`. |
+| `DISCORD_WEBHOOK_URL` (optional) | Discord channel webhook URL for instant approval cards (Channel Settings $\rightarrow$ Integrations $\rightarrow$ Webhooks). |
+| `SMTP_SERVER` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `NOTIFY_EMAIL` (optional) | SMTP details for approval emails (e.g. `smtp.gmail.com`, `587`). |
+| `DASHBOARD_URL` (optional) | Public URL of your Vercel Human-in-the-Loop Dashboard. |
 
 #### Step-by-Step Gist Setup:
 1. Go to [gist.github.com](https://gist.github.com).
