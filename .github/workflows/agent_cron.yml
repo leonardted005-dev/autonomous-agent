@@ -34,6 +34,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          XKIRO_API_KEY: ${{ secrets.XKIRO_API_KEY }}
           CUSTOM_GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
         run: |

@@ -109,15 +109,25 @@ class TestAutonomousAgentCore(unittest.TestCase):
 
 
 class TestLLMFailover(unittest.TestCase):
-    def test_ledger_registers_four_providers(self):
+    def test_ledger_registers_five_providers(self):
         from agent_core import LLMClient
         ledger = LLMClient.FALLBACK_PRIORITY_LEDGER
-        self.assertEqual(len(ledger), 4)
-        self.assertEqual([p["name"] for p in ledger], ["groq", "gemini", "mistral", "openrouter"])
+        self.assertEqual(len(ledger), 5)
+        self.assertEqual([p["name"] for p in ledger], ["groq", "gemini", "mistral", "openrouter", "xkiro"])
         self.assertEqual(ledger[0]["model"], "qwen/qwen3.8-27b")
         self.assertEqual(ledger[1]["model"], "gemini-1.5-flash")
         self.assertEqual(ledger[2]["model"], "mistral-small-latest")
         self.assertEqual(ledger[3]["model"], "openrouter/free")
+        self.assertEqual(ledger[4]["key_env"], "XKIRO_API_KEY")
+        self.assertEqual(ledger[4]["api_base"], "https://api.xkiro.com/v1")
+
+    def test_xkiro_included_when_key_present(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"XKIRO_API_KEY": "xk_test"}, clear=False):
+            client = LLMClient(AgentConfig())
+            chain = client._resolve_provider_chain()
+            names = [p["name"] for p in chain]
+            self.assertIn("xkiro", names)
 
     def test_chain_skips_providers_without_keys(self):
         from unittest.mock import patch

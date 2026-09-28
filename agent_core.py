@@ -277,6 +277,7 @@ class LLMClient:
       Priority 2: Gemini     (GEMINI_API_KEY,     googleapis.com, gemini-1.5-flash)
       Priority 3: Mistral    (MISTRAL_API_KEY,    mistral.ai, mistral-small-latest)
       Priority 4: OpenRouter (OPENROUTER_API_KEY, openrouter.ai, openrouter/free)
+      Priority 5: xKiro      (XKIRO_API_KEY,      api.xkiro.com, open-weights fallback)
     """
 
     # Fallback Priority Ledger: ordered provider chain for rate-limit resilience.
@@ -285,6 +286,7 @@ class LLMClient:
         {"name": "gemini", "api_base": "https://generativelanguage.googleapis.com/v1beta/openai", "model": "gemini-1.5-flash", "key_env": "GEMINI_API_KEY"},
         {"name": "mistral", "api_base": "https://api.mistral.ai/v1", "model": "mistral-small-latest", "key_env": "MISTRAL_API_KEY"},
         {"name": "openrouter", "api_base": "https://openrouter.ai/api/v1", "model": "openrouter/free", "key_env": "OPENROUTER_API_KEY"},
+        {"name": "xkiro", "api_base": "https://api.xkiro.com/v1", "model": "qwen/qwen3-32b", "key_env": "XKIRO_API_KEY"},
     ]
 
     # HTTP statuses that trigger failover to the next priority provider.
@@ -482,9 +484,14 @@ class AutonomousAgent:
     def generate_monologue(self, prompt: str) -> str:
         """Enforces an internal structured monologue and autonomous reasoning from the AI brain."""
         system_prompt = (
-            "You are a fully self-improving autonomous entity. In the PLAN phase, look at your "
-            "long-term memory Gist, decide what the most lucrative or educational digital task is right now, "
-            "select a tool from your toolbox, and execute it. Log your successes and failures to adapt your behavior over time.\n\n"
+            "You are a fully self-improving autonomous entity. Your objective is to identify digital arbitrage, freelance development tasks, "
+            "or automated micro-business opportunities. Browse public boards and tech updates to identify gaps and other ways you can "
+            "think of or find online to make money. In the PLAN phase, look at your long-term memory Gist, decide what the most "
+            "lucrative or educational digital task is right now, select a tool from your toolbox, and execute it. Log your successes "
+            "and failures to adapt your behavior over time.\n\n"
+            "CRITICAL SAFETY BOUNDARY: If an operation requires a legal profile, an invoice, or an account creation step, you must "
+            "formulate a structured 'Human Intervention Request' detailing the platform, the reason, and the registration link, write "
+            "it to a file named `human_action_needed.json`, and pause that specific thread until the asset is provided.\n\n"
             "AVAILABLE TOOLBOX CAPABILITIES:\n"
             "1. web_browser_tool(url: str): Fetches HTML/RSS/text content from public feeds, job boards, or websites.\n"
             "2. file_writer_tool(filepath: str, content: str): Writes scripts, portfolios, reports, or data files in local workspace.\n"
