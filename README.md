@@ -6,9 +6,13 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
 1. **`state_manager.py`**:
    - Implements a deterministic Finite State Machine (FSM):
      `WAKE_UP` -> `PLAN` -> `EXECUTE` -> `EVALUATE` -> `SLEEP` (with `ERROR` and `PENDING_APPROVAL` handling).
-   - `PLAN` and `EXECUTE` may enter `PENDING_APPROVAL` when a task involves external platforms, financial transactions, or asset publishing (Human-in-the-Loop gate).
    - Validates legal directional transitions.
    - Preserves state change audit logs and execution cycle context (`AgentContext`).
+   - Owns the **Non-Blocking Multi-Task Proposal Ledger** (`AgentContext.proposals_ledger`): a persistent global
+     array of human-gated tasks, each with a unique `task_id` and a `status` (`PENDING_APPROVAL` / `COMPLETED` /
+     `DENIED`). Helper surface: `append_proposal()`, `get_proposal()`, `remove_proposal()`, `purge_proposals()`,
+     `pending_proposals()`, `ledger_summary()`. The ledger is global state and deliberately survives
+     `reset_for_new_cycle()`.
 
 2. **`memory_bridge.py`**:
    - Defines `BaseMemoryBridge`, an abstract interface decoupling the agent logic from external database backends (Supabase, DynamoDB, Redis, S3, or GitHub artifacts).
@@ -18,6 +22,9 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
    - The primary autonomous orchestrator (`AutonomousAgent`).
    - Uses standard library `urllib` to invoke OpenAI-compatible LLM endpoints without paid or heavy SDK dependencies.
    - Enforces structured internal monologues (`THINKING PROCESS`, `STEP-BY-STEP PLAN`, `EXECUTION ASSESSMENT`).
+   - Runs a **non-blocking** Human-in-the-Loop gate: `_register_gate()`, `_enter_pending_approval()`,
+     `_evaluate_human_gate()`, `_process_proposal_ledger()` and `_queue_ledger_task()` park gated work in the ledger
+     and immediately resume the plan, then reconcile human decisions on the next wake-up.
    - Implements fault-tolerant error containment: exceptions transition to `ERROR` and persist context before gracefully winding down to `SLEEP`.
 
    - Embeds standard Python `Toolbox` with 3 zero-dependency capabilities:
@@ -29,9 +36,23 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
 
 ### Advanced Autonomy Features
 
-- **Account Wall Routing Gate** — when the agent finds a high-value platform (Upwork, Freelancer, GitHub Sponsors, etc.) that demands registration, sign-up, login, or verification, it is forbidden from skipping it. It halts and raises an **Account Creation & Verification** proposal (`requires_account`, `registration_link`, `session_active`) so the human can approve it on the dashboard instead of the opportunity being silently dropped.
-- **Multi-Step Tool Chaining (batch processing)** — a single 10-minute run now executes an internal tool chain: each step runs, its output is appended to the FSM `working_memory`, and the next link processes with that context. Bounded by `MAX_TOOL_CALLS_PER_CYCLE` (default **5**) so nothing can loop forever; the EVALUATE phase receives the chain summary before the agent enters `SLEEP`.
-- **Invisible Cookie-Session Handshake** — `web_browser_tool` automatically injects an optional `session_cookies` map (top-level in the Gist state) as a standard `Cookie:` request header. The human signs in on their own machine, pastes the cookie string into the dashboard, and the agent wakes up already authenticated — it never receives a password. Values are redacted in logs/proposals.
+- **Non-Blocking Multi-Task Proposal Ledger** — the single blocking `pending_proposal` dictionary is gone. When the
+  agent meets a task that needs human intervention, an account wall, or external publishing, it packages the action
+  and appends it to the global `proposals_ledger` with a unique ID and a status of `PENDING_APPROVAL`, then
+  **immediately continues its next planned pipeline step in the same run**. The FSM only settles into `SLEEP` once
+  the entire multi-step plan for that cycle is concluded, so many verifications can wait on the dashboard in
+  parallel while the agent keeps exploring new opportunities. Gate registration is de-duplicated, so a step detected
+  in both `PLAN` and `EXECUTE` produces exactly one ledger entry and one alert.
+- **Account Wall Routing Gate** — when the agent finds a high-value platform (Upwork, Freelancer, GitHub Sponsors, etc.) that demands registration, sign-up, login, or verification, it is forbidden from skipping it. It raises an **Account Creation & Verification** proposal (`requires_account`, `registration_link`, `session_active`) so the human can approve it on the dashboard instead of the opportunity being silently dropped.
+- **Multi-Step Batch Processing (tool chaining)** — a single run executes an internal tool chain of up to **5**
+  sequential execution steps (`MAX_CHAIN_STEPS_PER_CYCLE`). Each step runs, its output is appended to the FSM
+  `working_memory`, and the next link processes with that context. Bounded by `MAX_TOOL_CALLS_PER_CYCLE` (default
+  **5**) so nothing can loop forever; the EVALUATE phase receives the chain summary before the agent enters `SLEEP`.
+- **Invisible Cookie-Session Handshake** — `web_browser_tool` automatically injects the optional top-level
+  `session_cookies` dictionary from the Gist state into outgoing request headers as standard `Cookie:` literals
+  (`name=value; name2=value2`). The human signs in on their own machine, pastes the cookie string into the dashboard,
+  and the agent wakes up already authenticated — it never receives a password. Values are sanitized and redacted in
+  logs/proposals.
 
 
 4. **`cloud_memory_bridge.py`**:
@@ -45,7 +66,8 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
 |---|---|---|
 | `AGENT_ID` | `default_stateless_agent` | Identifier for the agent instance. |
 | `MAX_STEPS_PER_RUN` | `5` | Maximum atomic steps allowed per invocation. |
-| `MAX_TOOL_CALLS_PER_CYCLE` | `5` | Safety bound on chained `TOOL_CALL` links executed inside one cloud run. |
+| `MAX_TOOL_CALLS_PER_CYCLE` | `5` | Safety bound on chained `TOOL_CALL` links executed inside one cloud run (capped at the 5-step batch window). |
+| `MAX_CHAIN_STEPS_PER_CYCLE` | `5` | Hard ceiling on sequential execution steps per cycle (compile-time constant `MAX_CHAIN_STEPS_PER_CYCLE`). |
 | `LLM_PROVIDER` | `openai` | LLM provider (`openai`, `groq`, `anthropic`). |
 | `LLM_MODEL` | `gpt-4o-mini` | Target completion model name. |
 | `LLM_API_BASE` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |
@@ -67,17 +89,30 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
 
 ## Human-in-the-Loop Dashboard Gateway
 
-When the agent detects a task that touches external platforms, money movement, or asset publishing, it pauses for your approval:
+When the agent detects a task that touches external platforms, money movement, or asset publishing, it routes it into the ledger without stopping:
 
-1. The FSM enters `PENDING_APPROVAL` and persists a `pending_proposal` JSON dictionary inside the Gist state with: `task_id`, `type` (Freelance Pitch / Code Asset Sale / Trend Report / Account Creation & Verification), `target_platform`, `proposed_action`, `generated_files`, and `estimated_revenue`. Account-wall proposals additionally carry `requires_account`, `registration_link`, and `session_active`.
-2. The moment the proposal is created, the zero-dependency `NotificationManager` fires instant alerts (before any SLEEP phase):
-   - **Discord** (`DISCORD_WEBHOOK_URL`): an embedded approval card with Task ID, Platform, Estimated Revenue, and a direct Vercel Dashboard link (`DASHBOARD_URL`, default `https://autonomous-agent.vercel.app`).
+1. The gated task is **appended to the global `proposals_ledger`** (top-level in the Gist state) with a unique
+   `task_id` and `status: "PENDING_APPROVAL"`, alongside `human_decision: null` and the review payload: `type`
+   (Freelance Pitch / Code Asset Sale / Trend Report / Account Creation & Verification), `target_platform`,
+   `proposed_action`, `generated_files`, and `estimated_revenue`. Account-wall proposals additionally carry
+   `requires_account` and `registration_link`.
+2. The run **keeps going**. The agent immediately executes its remaining planned pipeline steps and only settles
+   into `SLEEP` once the whole multi-step plan for the cycle has concluded — so several tasks can wait for you at
+   once while the agent continues working. `task_id` is derived deterministically and de-duplicated, so a step
+   detected in both `PLAN` and `EXECUTE` yields exactly one ledger entry.
+3. Immediately after each task is parked, the zero-dependency `NotificationManager` fires instant alerts:
+   - **Discord** (`DISCORD_WEBHOOK_URL`): an embedded approval card with Task ID, Platform, Estimated Revenue, and a direct Vercel Dashboard link (`DASHBOARD_URL`, default `https://autonomous-agent-gateway.vercel.app`).
    - **Email** (`SMTP_SERVER`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, optional `NOTIFY_EMAIL`): a summary alert that a task awaits review (uses `smtplib`, STARTTLS on 587 / SSL on 465).
-3. On the next wake-up the agent reads `human_decision` from the persisted state:
-   - `null` $\rightarrow$ immediately `SLEEP` without executing (waiting for you).
-   - `"APPROVED"` $\rightarrow$ proceeds to the execution block with the stored plan.
-   - `"DENIED"` $\rightarrow$ clears the task and returns to planning.
-4. To decide, edit your Gist state JSON and set `human_decision` inside `context_data` to `APPROVED` or `DENIED`.
+4. On the next wake-up `_evaluate_human_gate` / `_process_proposal_ledger` walks the ledger in one pass, matching
+   decisions case-insensitively and whitespace-tolerantly (`.strip().upper() == "APPROVED"`):
+   - `"APPROVED"` $\rightarrow$ prints `[SUCCESS] Human approval validated for task <id>. Clearing gate and launching task chain...`, immediately queues **that specific task** into the active execution window, runs its stored `proposed_action` payload, and flips its ledger status to `COMPLETED`.
+   - `"DENIED"` $\rightarrow$ the entry is **purged** from the active ledger array.
+   - `null` (no decision yet) $\rightarrow$ the entry is **left completely untouched**, waiting safely on the dashboard while the rest of the agent runs independently.
+5. Meanwhile the un-gated remainder of the run proceeds normally; an approved task's execution results are appended
+   to `execution_results` and summarised into `working_memory` like any other chain link.
+
+Legacy compatibility: a state file still carrying the old single `context_data.pending_proposal` (plus
+`context_data.human_decision`) is automatically migrated into the ledger on wake-up.
 
 ## Human-in-the-Loop Dashboard (Vercel)
 
@@ -95,9 +130,9 @@ The gateway UI lives in a single self-contained file: **`index.html`** (Tailwind
 ### Features
 - **Command center UI** — dark responsive layout with an active agent connection card, a live lifecycle tracker (`WAKE_UP → PLAN → EXECUTE → PENDING_APPROVAL → EVALUATE → SLEEP`), and a metrics panel (Cycle Count, Est. Revenue, Task Type, Target Platform).
 - **Lockable credentials panel** — `GIST_ID`, `GIT_TOKEN`, and optional `AGENT_ID` are stored exclusively in the browser's `localStorage` (never sent anywhere except `api.github.com`).
-- **Proposal render engine** — uses the GitHub Gists REST API (`GET /gists/{id}`, `PATCH /gists/{id}`) with `async/await`; when the agent state is `PENDING_APPROVAL` a prominent alert card shows Task ID, platform, proposed action, generated-file code previews, and expected revenue.
-- **1-button controls** — `🟢 APPROVE TASK` / `🔴 DENY TASK` patch `context_data.human_decision` (`APPROVED` / `DENIED`) in the Gist and confirm that the cloud runner will act on the next 30-minute cron cycle.
-- **Injected Cookie String field** — an optional textarea in the proposal card. Sign into the platform on your own PC, copy the `Cookie:` header from DevTools → Network, paste it in, and press **APPROVE**: the dashboard parses `name=value` pairs (attribute tokens like `Secure`/`HttpOnly` are skipped) and writes them to the top-level `session_cookies` of the Gist state, so the agent wakes up already logged in and never sees a password. A 🍪 badge shows how many cookies are active (names only).
+- **Proposal ledger render engine** — uses the GitHub Gists REST API (`GET /gists/{id}`, `PATCH /gists/{id}`) with `async/await`. Every `PENDING_APPROVAL` entry in `proposals_ledger` is rendered as its own card with Task ID, platform, proposed action, generated-file code previews, expected revenue, and — for account walls — the registration link. Entries already `COMPLETED` or `DENIED` are excluded.
+- **Per-task 1-button controls** — each card owns its own `🟢 APPROVE TASK` / `🔴 DENY TASK` pair, writing `human_decision` into **that specific ledger entry** (`APPROVED` / `DENIED`, and `status: DENIED` on a denial) while leaving every other task untouched.
+- **Injected Cookie String field** — a per-card textarea. Sign into the platform on your own PC, copy the `Cookie:` header from DevTools → Network, paste it in, and press **APPROVE**: the dashboard parses `name=value` pairs (attribute tokens like `Secure`/`HttpOnly`/`SameSite` are skipped) and writes them to the top-level `session_cookies` of the Gist state, so the agent wakes up already logged in and never sees a password. A 🍪 badge shows how many cookies are active (names only).
 
 ### Deploy to Vercel (free)
 ```bash
@@ -115,7 +150,7 @@ Open the deployed URL (**https://autonomous-agent-gateway.vercel.app**), click *
 
 ### Dashboard regression test
 ```bash
-node dashboard_smoke_test.js   # 15/15 checks: render + APPROVE patch flow (uses a stubbed Gist)
+node dashboard_smoke_test.js   # 34/34 checks: ledger render + per-task APPROVE/DENY + cookie handshake (stubbed Gist)
 ```
 
 ## Running the Agent
