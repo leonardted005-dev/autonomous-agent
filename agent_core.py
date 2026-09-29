@@ -13,6 +13,15 @@ Core Responsibilities:
    "Execution Assessment").
 5. Implements resilient error handling and boundary safety to prevent unhandled crashes
    and ensure graceful shutdown / state preservation under failure.
+6. Maintains a Non-Blocking Multi-Task Proposal Ledger: human-gated work is appended to a
+   persistent global array (`proposals_ledger`) with a unique ID and a `PENDING_APPROVAL`
+   status, and the agent immediately proceeds to its next planned pipeline step within the
+   same run. The lifecycle only settles into SLEEP once the whole multi-step plan for the
+   cycle has concluded, so many verifications can wait on the dashboard in parallel while
+   the agent keeps exploring new opportunities.
+7. Injects a human-provided `session_cookies` map from the Gist state into outgoing
+   request headers as standard Cookie literals, so the agent can work inside an
+   environment the operator logged into from the dashboard without ever seeing a password.
 """
 
 from __future__ import annotations
@@ -37,7 +46,16 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from memory_bridge import BaseMemoryBridge, LocalFileMemoryBridge, MemoryLogEntry, ShortTermState
 from cloud_memory_bridge import GitHubGistMemoryBridge
-from state_manager import AgentContext, AgentState, StateManager
+from state_manager import (
+    AgentContext,
+    AgentState,
+    ProposalStatus,
+    StateManager,
+)
+
+# Maximum sequential execution steps (internal tool-chain links) allowed per cycle
+# before the run concludes and the FSM settles into SLEEP.
+MAX_CHAIN_STEPS_PER_CYCLE = 5
 
 # Setup structured logger
 logging.basicConfig(
@@ -52,7 +70,7 @@ class AgentConfig:
     """Agent runtime configuration sourced from environment variables."""
     agent_id: str = os.getenv("AGENT_ID", "default_stateless_agent")
     max_steps_per_run: int = int(os.getenv("MAX_STEPS_PER_RUN", "5"))
-    max_tool_calls_per_cycle: int = int(os.getenv("MAX_TOOL_CALLS_PER_CYCLE", "5"))
+    max_tool_calls_per_cycle: int = int(os.getenv("MAX_TOOL_CALLS_PER_CYCLE", str(MAX_CHAIN_STEPS_PER_CYCLE)))
     llm_provider: str = os.getenv(
         "LLM_PROVIDER",
         "groq" if os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY") else "openai"
@@ -649,6 +667,13 @@ class AutonomousAgent:
                 active_plan=saved_state.active_plan,
                 payload=saved_state.context_data,
             )
+            # Hydrate the persistent global ledger. Prefer the top-level array; fall back
+            # to a ledger mirrored inside context_data for older/newer dashboard shapes.
+            ledger = saved_state.proposals_ledger or context.payload.get("proposals_ledger") or []
+            context.proposals_ledger = [
+                dict(entry) for entry in ledger if isinstance(entry, dict)
+            ] if isinstance(ledger, list) else []
+            logger.info("Hydrated proposals_ledger with %d entr(ies) from previous run.", len(context.proposals_ledger))
         else:
             logger.info("No prior state found. Bootstrapping initial agent context.")
             context = AgentContext(
@@ -658,6 +683,25 @@ class AutonomousAgent:
             )
 
         self.state_manager = StateManager(context)
+
+        # Backwards compatibility: promote an old-format single blocking `pending_proposal`
+        # (with its top-level `human_decision`) into the global ledger so agent states or
+        # dashboards that predate the ledger still hand their task over safely.
+        legacy = context.payload.get("pending_proposal")
+        if isinstance(legacy, dict):
+            migrated = dict(legacy)
+            legacy_decision = context.payload.get("human_decision")
+            if legacy_decision is not None and not migrated.get("human_decision"):
+                migrated["human_decision"] = legacy_decision
+            entry = self.state_manager.append_proposal(migrated)
+            if migrated.get("human_decision") is not None:
+                entry["human_decision"] = migrated.get("human_decision")
+            context.payload["pending_proposal"] = entry
+            logger.info(
+                "Migrated legacy pending_proposal into proposals_ledger as task %s.",
+                entry.get("task_id"),
+            )
+
         self.memory.append_long_term_log(
             self.config.agent_id,
             MemoryLogEntry(
@@ -684,7 +728,11 @@ class AutonomousAgent:
             active_plan=ctx.active_plan,
             context_data=ctx.payload,
             session_cookies=getattr(self, "session_cookies", {}) or {},
+            proposals_ledger=self.state_manager.proposals_ledger,
         )
+        # Mirror the ledger into context_data so legacy dashboard builds that read
+        # `context_data` still see every task awaiting the human.
+        ctx.payload["proposals_ledger"] = self.state_manager.proposals_ledger
         self.memory.save_short_term_state(self.config.agent_id, snapshot)
 
     def update_session_cookies(self, cookies: Dict[str, str]) -> Dict[str, str]:
@@ -722,18 +770,25 @@ class AutonomousAgent:
             "ACCOUNT WALL ROUTING GATE (MANDATORY): You are forbidden from skipping gated work. If you discover a "
             "high-value platform or work opportunity (e.g. Upwork, Freelancer, GitHub Sponsors) that requires "
             "registration, sign-up, or login, you MUST NOT skip it, work around it, or pretend it does not exist. "
-            "Instead, immediately halt and route it into an active gate: emit a TOOL_CALL to file_writer_tool "
+            "Instead, immediately route it into an active gate: emit a TOOL_CALL to file_writer_tool "
             "writing 'human_action_needed.json' that contains the platform name, a registration link, and the reason "
             "access is needed. This raises an 'Account Creation & Verification Proposal' so the human approves it "
             "on the dashboard. Treat every login wall, signup form, or email-verification demand as this active "
             "routing gate, never as a reason to abandon the opportunity.\n\n"
+            "NON-BLOCKING MULTI-TASK PROPOSAL LEDGER (CRITICAL): Raising a gate NEVER stops your run. The framework "
+            "packages the gated action, appends it to a persistent global 'proposals_ledger' with a unique task ID "
+            "and a status of PENDING_APPROVAL, and you MUST immediately continue with your next planned pipeline "
+            "step in this same cycle. Never wait for the human mid-plan and never end your run early because a "
+            "gate was raised: multiple verifications may sit on the dashboard simultaneously while you keep "
+            "exploring new opportunities. Only stop after your entire multi-step plan for the cycle is concluded.\n\n"
             "CRITICAL SAFETY BOUNDARY: If an operation requires a legal profile, an invoice, or an account creation step, you must "
             "formulate a structured 'Human Intervention Request' detailing the platform, the reason, and the registration link, write "
-            "it to a file named `human_action_needed.json`, and pause that specific thread until the asset is provided. "
-            "NEVER fabricate credentials or attempt to create accounts yourself.\n\n"
+            "it to a file named `human_action_needed.json`, and park that specific thread in the proposal ledger until the asset is "
+            "provided. NEVER fabricate credentials or attempt to create accounts yourself.\n\n"
             "AVAILABLE TOOLBOX CAPABILITIES:\n"
             "1. web_browser_tool(url: str): Fetches HTML/RSS/text content from public feeds, job boards, or websites. "
-            "If 'session_cookies' are present in memory, it reuses your authenticated session automatically.\n"
+            "It automatically injects any human-provided `session_cookies` from memory as a standard Cookie header, "
+            "so you reuse your authenticated session automatically.\n"
             "2. file_writer_tool(filepath: str, content: str): Writes scripts, portfolios, reports, or data files in local workspace.\n"
             "3. http_poster_tool(url: str, payload: dict, headers: dict = None): Sends POST requests to simulate platform actions or submit data.\n\n"
             "TOOL CALL FORMAT (CHAIN UP TO 5 SEQUENTIALLY):\n"
@@ -979,7 +1034,11 @@ class AutonomousAgent:
         return files
 
     def _build_pending_proposal(self, source_text: str, phase: str) -> Dict[str, Any]:
-        """Builds the structured pending_proposal JSON dictionary for the dashboard."""
+        """
+        Builds the structured proposal dictionary that is appended to the
+        global `proposals_ledger` for the dashboard. Carries a unique task ID
+        and, once stored, a `PENDING_APPROVAL` status.
+        """
         stamp = datetime.now(timezone.utc).isoformat()
         run_id = self.state_manager.context.run_id if self.state_manager else "unknown_run"
         task_id = hashlib.sha1(f"{run_id}:{stamp}:{source_text[:80]}".encode("utf-8")).hexdigest()[:12]
@@ -994,6 +1053,8 @@ class AutonomousAgent:
             "detected_in_phase": phase,
             "created_at": stamp,
             "requires_human": True,
+            "status": ProposalStatus.PENDING_APPROVAL.value,
+            "human_decision": None,
         }
         # Account-wall gate: attach the registration link and session availability.
         if proposal_type == "Account Creation & Verification":
@@ -1012,121 +1073,360 @@ class AutonomousAgent:
     def _evaluate_human_gate(self) -> str:
         """
         Human-in-the-loop gate evaluated on wake.
-        Returns one of: NONE (no pending task), AWAITING (sleep until decision),
-        APPROVED (resume execution), DENIED (clear task and re-plan).
+
+        Iterates the `proposals_ledger` and returns a compact verdict:
+          NONE     - no ledger entry is currently actionable
+          AWAITING - entries exist whose decision is still null
+          APPROVED - at least one entry was validated as APPROVED
+          DENIED   - at least one entry was validated as DENIED
+
+        Decisions are matched with case-insensitive, whitespace-tolerant string
+        checking (`.strip().upper() == "APPROVED"`) so front-end casing shifts are
+        handled cleanly. A DENIED verdict takes precedence over APPROVED only in the
+        return code; both are processed in the same pass by `_process_proposal_ledger`.
         """
         if not self.state_manager:
             return "NONE"
-        ctx = self.state_manager.context
-        pending = ctx.payload.get("pending_proposal")
-        resumed_pending = self._resume_state == AgentState.PENDING_APPROVAL.value
 
-        if resumed_pending and not pending:
-            logger.warning("State was PENDING_APPROVAL but no pending_proposal found; resuming normal planning.")
-            return "NONE"
-        if not pending:
+        ledger = self.state_manager.proposals_ledger
+        if not ledger:
             return "NONE"
 
-        decision = ctx.payload.get("human_decision")
-        if decision is None or str(decision).strip() == "":
-            return "AWAITING"
-        upper = str(decision).strip().upper()
-        if upper == "APPROVED":
+        approved = False
+        denied = False
+        awaiting = False
+
+        for entry in ledger:
+            if not isinstance(entry, dict):
+                continue
+            status = str(entry.get("status", "")).strip().upper()
+            if status == ProposalStatus.COMPLETED.value:
+                continue
+            raw_decision = entry.get("human_decision")
+            decision = str(raw_decision).strip().upper() if raw_decision is not None else ""
+            if decision == "APPROVED":
+                approved = True
+            elif decision == "DENIED":
+                denied = True
+            else:
+                awaiting = True
+
+        if approved:
             return "APPROVED"
-        if upper == "DENIED":
+        if denied:
             return "DENIED"
-        logger.warning("Unknown human_decision '%s'; treating as awaiting approval.", decision)
-        return "AWAITING"
+        if awaiting:
+            return "AWAITING"
+        return "NONE"
 
-    def _enter_pending_approval(self, source_text: str, phase: str) -> Dict[str, Any]:
-        """Formats and persists the pending_proposal, halting the cycle for human review."""
+    def _detect_ledger_decision(self, entry: Dict[str, Any]) -> str:
+        """
+        Resolves a single ledger entry's human decision.
+        Tolerates front-end casing shifts via `.strip().upper()`.
+        """
+        raw = entry.get("human_decision")
+        if raw is None:
+            # Dashboard writes into context_data for the legacy single-task shape.
+            ctx = self.state_manager.context if self.state_manager else None
+            legacy = ctx.payload.get("human_decision") if ctx else None
+            if legacy is not None and len(self.state_manager.proposals_ledger) == 1:
+                raw = legacy
+        return str(raw).strip().upper() if raw is not None else ""
+
+    def _queue_ledger_task(
+        self,
+        task: Dict[str, Any],
+        origin: str = "HUMAN_APPROVAL",
+    ) -> Dict[str, Any]:
+        """
+        Queues a human-approved ledger task into the active execution window,
+        runs its code/payload, and flips its ledger status to COMPLETED.
+
+        The persisted `proposed_action` is replayed through the normal chained
+        tool-call executor, so an approved task executes exactly what was reviewed.
+        """
         assert self.state_manager is not None
         ctx = self.state_manager.context
-        proposal = self._build_pending_proposal(source_text, phase)
-        ctx.payload["pending_proposal"] = proposal
-        ctx.payload["human_decision"] = None
+        task_id = str(task.get("task_id", "unknown"))
+        action_text = str(task.get("proposed_action", "") or task.get("type", "") or "")
+
+        logger.info(
+            "Queuing approved task %s into the active execution window (origin=%s).",
+            task_id, origin,
+        )
+
+        # The approved task runs as its own bounded batch inside the execution window.
+        result = self._parse_and_execute_step(action_text or f"1. Execute approved task {task_id}")
+        result["task_id"] = task_id
+        result["origin"] = origin
+        result["approved_task"] = {
+            "task_id": task_id,
+            "type": task.get("type"),
+            "target_platform": task.get("target_platform"),
+            "estimated_revenue": task.get("estimated_revenue"),
+        }
+        ctx.execution_results.append(result)
+
+        summary = self._summarize_tool_output(result)
+        if summary:
+            self._working_memory.append(f"Approved task {task_id} outcome: {summary}")
+            self._working_memory = self._working_memory[-10:]
+            ctx.working_memory[:] = self._working_memory
+
+        task["status"] = ProposalStatus.COMPLETED.value
+        task["completed_at"] = datetime.now(timezone.utc).isoformat()
+        task["completion_summary"] = summary[:600]
+        task["execution_results"] = result.get("tool_calls", [])
 
         self.memory.append_long_term_log(
             self.config.agent_id,
             MemoryLogEntry(
-                entry_id=f"pending_{datetime.now(timezone.utc).timestamp()}",
+                entry_id=f"complete_{task_id}_{datetime.now(timezone.utc).timestamp()}",
+                event_type="COMPLETED",
+                payload={"task_id": task_id, "origin": origin, "summary": summary[:600]},
+            ),
+        )
+        logger.info("Task %s executed and flipped to COMPLETED.", task_id)
+        return result
+
+    def _process_proposal_ledger(self) -> Dict[str, List[str]]:
+        """
+        Walks the entire `proposals_ledger` in one pass on wake:
+
+          * APPROVED -> print the validation banner, immediately queue that specific
+            task into the active execution window, run its payload, flip to COMPLETED.
+          * DENIED   -> purge the entry from the active array.
+          * null / blank / unknown decision -> left completely untouched, waiting safely
+            on the dashboard while the rest of the agent runs independently.
+
+        Returns a tally of what was processed so the caller can decide whether to keep
+        running. Never raises into the lifecycle: individual failures are contained.
+        """
+        tally: Dict[str, List[str]] = {"approved": [], "denied": [], "pending": [], "completed": []}
+        if not self.state_manager:
+            return tally
+
+        ledger = self.state_manager.proposals_ledger
+        if not ledger:
+            return tally
+
+        logger.info("Evaluating proposals_ledger (%d entr(ies) present).", len(ledger))
+
+        for entry in list(ledger):
+            if not isinstance(entry, dict):
+                continue
+
+            task_id = str(entry.get("task_id", "unknown"))
+            status = str(entry.get("status", "")).strip().upper()
+            if status == ProposalStatus.COMPLETED.value:
+                tally["completed"].append(task_id)
+                continue
+
+            decision = self._detect_ledger_decision(entry)
+
+            if decision == "APPROVED":
+                print(
+                    f"[SUCCESS] Human approval validated for task {task_id}. "
+                    "Clearing gate and launching task chain..."
+                )
+                logger.info(
+                    "Human approval validated for task %s. Clearing gate and launching task chain...",
+                    task_id,
+                )
+                entry["human_decision"] = "APPROVED"
+                try:
+                    self._queue_ledger_task(entry, origin="HUMAN_APPROVAL")
+                    tally["approved"].append(task_id)
+                except Exception as exec_err:
+                    logger.error("Approved task %s failed during execution: %s", task_id, exec_err)
+                    entry["status"] = ProposalStatus.PENDING_APPROVAL.value
+                    entry["last_error"] = str(exec_err)
+                    tally["pending"].append(task_id)
+
+            elif decision == "DENIED":
+                purged = self.state_manager.remove_proposal(task_id)
+                if purged is not None:
+                    purged["status"] = ProposalStatus.DENIED.value
+                logger.info("Human DENIED task %s; purged from the active ledger array.", task_id)
+                self.memory.append_long_term_log(
+                    self.config.agent_id,
+                    MemoryLogEntry(
+                        entry_id=f"denied_{task_id}_{datetime.now(timezone.utc).timestamp()}",
+                        event_type="DENIED",
+                        payload={"cleared_task_id": task_id, "type": entry.get("type")},
+                    ),
+                )
+                tally["denied"].append(task_id)
+
+            else:
+                # null decision (or an unrecognised value): leave it waiting safely.
+                tally["pending"].append(task_id)
+                logger.debug(
+                    "Task %s left untouched in the ledger (decision=%r).", task_id, entry.get("human_decision")
+                )
+
+        # Drop execution results that were not attached to a ledger task.
+        return tally
+
+    def _find_proposal_for_action(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        Locates an existing ledger entry whose proposed_action matches `text`
+        (either direction of containment, whitespace-normalized).
+        Used to guarantee one ledger entry per gated action across PLAN and EXECUTE.
+        """
+        if not self.state_manager or not text:
+            return None
+        needle = " ".join(str(text).split()).strip()
+        if not needle:
+            return None
+        for entry in self.state_manager.proposals_ledger:
+            if not isinstance(entry, dict):
+                continue
+            haystack = " ".join(str(entry.get("proposed_action", "")).split()).strip()
+            if not haystack:
+                continue
+            if needle in haystack or haystack in needle:
+                return entry
+        return None
+
+    def _register_gate(self, source_text: str, phase: str) -> Optional[Dict[str, Any]]:
+        """
+        Non-blocking gate registration with deduplication.
+
+        If the same action is already parked in the ledger (typically detected during
+        PLAN and re-observed during EXECUTE), the existing entry is returned and no
+        duplicate is appended. Otherwise the new task is appended with a unique ID and
+        a PENDING_APPROVAL status and the caller immediately continues its pipeline.
+        """
+        existing = self._find_proposal_for_action(source_text)
+        if existing is not None:
+            logger.info(
+                "Task %s already parked in proposals_ledger; skipping duplicate gate registration.",
+                existing.get("task_id"),
+            )
+            return existing
+
+        proposal = self._enter_pending_approval(source_text, phase)
+        self.notifier.send_alerts(proposal)
+        logger.info(
+            "Cycle continues: task %s parked in proposals_ledger while remaining steps execute.",
+            proposal.get("task_id"),
+        )
+        return proposal
+
+    def _enter_pending_approval(self, source_text: str, phase: str) -> Dict[str, Any]:
+        """
+        Packages the human-gated action, appends it to the global `proposals_ledger`
+        with a unique ID and a PENDING_APPROVAL status, and returns immediately.
+
+        This is deliberately NON-BLOCKING: the caller keeps executing the rest of its
+        planned pipeline steps within the same run instead of halting the lifecycle.
+        """
+        assert self.state_manager is not None
+        ctx = self.state_manager.context
+        proposal = self._build_pending_proposal(source_text, phase)
+
+        stored = self.state_manager.append_proposal(proposal)
+        # Mirror the newest proposal into context_data so legacy dashboard builds
+        # (and the single-task approval flow) continue to render a proposal card.
+        ctx.payload["pending_proposal"] = stored
+        ctx.payload.setdefault("proposals_ledger", self.state_manager.proposals_ledger)
+
+        self.memory.append_long_term_log(
+            self.config.agent_id,
+            MemoryLogEntry(
+                entry_id=f"pending_{stored.get('task_id')}_{datetime.now(timezone.utc).timestamp()}",
                 event_type="PENDING_APPROVAL",
-                payload={"pending_proposal": proposal},
+                payload={
+                    "pending_proposal": stored,
+                    "ledger_depth": len(self.state_manager.proposals_ledger),
+                },
             ),
         )
         logger.info(
-            "Task %s requires human approval (type=%s, platform=%s). Persisting pending_proposal.",
-            proposal["task_id"], proposal["type"], proposal["target_platform"],
+            "Task %s queued for human approval (type=%s, platform=%s). "
+            "Ledger now holds %d entr(ies); continuing pipeline without blocking.",
+            stored.get("task_id"), stored.get("type"), stored.get("target_platform"),
+            len(self.state_manager.proposals_ledger),
         )
-        return proposal
+        return stored
 
     def run_cycle(self) -> None:
         """
         Executes one full lifecycle iteration: WAKE_UP -> PLAN -> EXECUTE -> EVALUATE -> SLEEP.
         Wraps each transition safely so uncaught errors route to the ERROR state
         and save state before shutdown.
+
+        Human-gated work never blocks the run: each gated task is appended to the global
+        `proposals_ledger` and the agent immediately proceeds to its next planned pipeline
+        step. The FSM settles into SLEEP only once the whole multi-step plan for the cycle
+        has concluded.
         """
         try:
             self.initialize_state()
             assert self.state_manager is not None
             ctx = self.state_manager.context
 
-            # --- 0. Human-in-the-Loop gate on wake ---
-            gate = self._evaluate_human_gate()
+            # --- 0. Human-in-the-Loop ledger reconciliation on wake ---
+            # Approved tasks are executed immediately; denied tasks are purged; entries
+            # with a null decision stay untouched while the agent runs independently.
             approved_resume = False
-            if gate == "AWAITING":
-                logger.info("Pending proposal awaits human decision. Sleeping without execution.")
-                self.memory.append_long_term_log(
-                    self.config.agent_id,
-                    MemoryLogEntry(
-                        entry_id=f"await_{datetime.now(timezone.utc).timestamp()}",
-                        event_type="PENDING_APPROVAL",
-                        payload={
-                            "detail": "human_decision is null; sleeping until dashboard decision",
-                            "pending_proposal": ctx.payload.get("pending_proposal"),
-                        },
-                    ),
+            gate = self._evaluate_human_gate()
+            if gate in ("APPROVED", "DENIED", "AWAITING"):
+                tally = self._process_proposal_ledger()
+                approved_resume = bool(tally.get("approved"))
+                logger.info(
+                    "Ledger reconciliation complete: %d approved, %d denied, %d still awaiting, %d already completed.",
+                    len(tally.get("approved", [])),
+                    len(tally.get("denied", [])),
+                    len(tally.get("pending", [])),
+                    len(tally.get("completed", [])),
                 )
-                self.state_manager.transition_to(AgentState.SLEEP, reason="Awaiting human decision on pending proposal")
-                self.persist_current_state()
-                logger.info("Agent paused in SLEEP awaiting human approval.")
-                return
-
-            if gate == "DENIED":
-                cleared = ctx.payload.pop("pending_proposal", None)
-                ctx.payload.pop("human_decision", None)
-                task_ref = cleared.get("task_id") if isinstance(cleared, dict) else "unknown"
-                logger.info("Human DENIED pending task %s; clearing task and returning to planning.", task_ref)
-                self.memory.append_long_term_log(
-                    self.config.agent_id,
-                    MemoryLogEntry(
-                        entry_id=f"denied_{datetime.now(timezone.utc).timestamp()}",
-                        event_type="DENIED",
-                        payload={"cleared_task_id": task_ref},
-                    ),
-                )
-            elif gate == "APPROVED":
-                cleared = ctx.payload.pop("pending_proposal", None)
-                ctx.payload.pop("human_decision", None)
-                approved_resume = True
-                task_ref = cleared.get("task_id") if isinstance(cleared, dict) else "unknown"
-                logger.info("Human APPROVED pending task %s; proceeding to execution block.", task_ref)
-                self.memory.append_long_term_log(
-                    self.config.agent_id,
-                    MemoryLogEntry(
-                        entry_id=f"approved_{datetime.now(timezone.utc).timestamp()}",
-                        event_type="APPROVED",
-                        payload={"approved_task_id": task_ref},
-                    ),
-                )
+                if tally.get("pending") and not (approved_resume or tally.get("denied")):
+                    self.memory.append_long_term_log(
+                        self.config.agent_id,
+                        MemoryLogEntry(
+                            entry_id=f"await_{datetime.now(timezone.utc).timestamp()}",
+                            event_type="PENDING_APPROVAL",
+                            payload={
+                                "detail": "ledger entries awaiting human decision; continuing pipeline independently",
+                                "awaiting_task_ids": tally["pending"],
+                            },
+                        ),
+                    )
 
             # --- 1. WAKE_UP -> PLAN ---
-            resume_reason = "Resuming human-approved task" if approved_resume and ctx.active_plan else "Initial plan formulation"
+            resume_reason = "Resuming human-approved task" if approved_resume else "Initial plan formulation"
             self.state_manager.transition_to(AgentState.PLAN, reason=resume_reason)
 
-            if approved_resume and ctx.active_plan:
-                monologue = "Resuming human-approved plan:\n" + "\n".join(ctx.active_plan)
-                logger.info("Skipping re-plan; executing human-approved active plan.")
+            monologue = ""
+            if approved_resume:
+                recent_logs = self.memory.retrieve_recent_logs(self.config.agent_id, limit=5)
+                log_summaries = [l.to_dict() for l in recent_logs]
+                session_hint = (
+                    f"Active session cookies (names only): {sorted(self.session_cookies.keys())}"
+                    if self.session_cookies else "No session cookies provided."
+                )
+                ledger_hint = json.dumps(self.state_manager.ledger_summary())
+                plan_prompt = (
+                    f"Agent ID: {self.config.agent_id}\n"
+                    f"Current Cycle: {ctx.cycle_count}\n"
+                    f"Recent Logs: {json.dumps(log_summaries)}\n"
+                    f"Proposals Ledger Status: {ledger_hint}\n"
+                    f"{session_hint}\n"
+                    "Task: A human-approved task chain has just been executed. Continue exploring new "
+                    "opportunities and formulate the next atomic operational plan "
+                    "(up to 5 chained TOOL_CALL steps)."
+                )
+                monologue = self.generate_monologue(plan_prompt)
+                logger.info("Internal Monologue Generated (post-approval):\n%s", monologue)
+                ctx.active_plan = [
+                    line.strip() for line in monologue.splitlines()
+                    if re.match(r"^\d+\.\s", line.strip())
+                ]
+                if self._requires_human_approval(monologue):
+                    self._register_gate(monologue, "PLAN")
+                    # Non-blocking: fall through and keep executing the rest of the plan.
             else:
                 recent_logs = self.memory.retrieve_recent_logs(self.config.agent_id, limit=5)
                 log_summaries = [l.to_dict() for l in recent_logs]
@@ -1134,10 +1434,12 @@ class AutonomousAgent:
                     f"Active session cookies (names only): {sorted(self.session_cookies.keys())}"
                     if self.session_cookies else "No session cookies provided."
                 )
+                ledger_hint = json.dumps(self.state_manager.ledger_summary())
                 plan_prompt = (
                     f"Agent ID: {self.config.agent_id}\n"
                     f"Current Cycle: {ctx.cycle_count}\n"
                     f"Recent Logs: {json.dumps(log_summaries)}\n"
+                    f"Proposals Ledger Status: {ledger_hint}\n"
                     f"{session_hint}\n"
                     "Task: Synthesize context and formulate an atomic operational plan "
                     "(up to 5 chained TOOL_CALL steps)."
@@ -1149,18 +1451,10 @@ class AutonomousAgent:
                     if re.match(r"^\d+\.\s", line.strip())
                 ]
 
-                # PLAN-phase Human-in-the-Loop detection
+                # PLAN-phase Human-in-the-Loop detection.
+                # NON-BLOCKING: the task is appended to the ledger and the run continues.
                 if self._requires_human_approval(monologue):
-                    proposal = self._enter_pending_approval(monologue, "PLAN")
-                    self.state_manager.transition_to(
-                        AgentState.PENDING_APPROVAL,
-                        reason="Plan involves external platform, financial transaction, or asset publishing",
-                    )
-                    # Instant alerts BEFORE any subsequent SLEEP phase
-                    self.notifier.send_alerts(proposal)
-                    self.persist_current_state()
-                    logger.info("Cycle halted in PENDING_APPROVAL state awaiting dashboard review.")
-                    return
+                    self._register_gate(monologue, "PLAN")
 
             self.memory.append_long_term_log(
                 self.config.agent_id,
@@ -1171,16 +1465,18 @@ class AutonomousAgent:
                 ),
             )
 
-            # --- 2. PLAN -> EXECUTE (multi-step tool chaining) ---
+            # --- 2. PLAN -> EXECUTE (multi-step batch processing / tool chaining) ---
             self.state_manager.transition_to(AgentState.EXECUTE, reason="Executing plan steps")
-            step_count = min(len(ctx.active_plan), self.config.max_steps_per_run)
-            budget = max(1, int(getattr(self.config, "max_tool_calls_per_cycle", 5) or 5))
+            step_limit = min(self.config.max_steps_per_run, MAX_CHAIN_STEPS_PER_CYCLE)
+            step_count = min(len(ctx.active_plan), step_limit)
+            budget = max(1, min(int(getattr(self.config, "max_tool_calls_per_cycle", MAX_CHAIN_STEPS_PER_CYCLE) or MAX_CHAIN_STEPS_PER_CYCLE), MAX_CHAIN_STEPS_PER_CYCLE))
             logger.info(
-                "Executing %d planned step(s) with internal tool-chain budget of %d link(s)...",
-                step_count, budget,
+                "Executing %d planned step(s) with internal tool-chain budget of %d link(s) "
+                "(max %d sequential steps per cycle).",
+                step_count, budget, MAX_CHAIN_STEPS_PER_CYCLE,
             )
 
-            triggered_step: Optional[str] = None
+            triggered_steps: List[str] = []
             tool_calls_used = 0
             chained_working_memory: List[str] = list(getattr(self, "_working_memory", []) or [])
             for idx in range(step_count):
@@ -1207,10 +1503,9 @@ class AutonomousAgent:
                 self._working_memory = chained_working_memory[-10:]
                 ctx.working_memory[:] = self._working_memory
 
-                if not approved_resume and triggered_step is None:
-                    wrote_human_file = self._wrote_human_action_file(result)
-                    if self._requires_human_approval(step_desc) or wrote_human_file:
-                        triggered_step = step_desc
+                wrote_human_file = self._wrote_human_action_file(result)
+                if self._requires_human_approval(step_desc) or wrote_human_file:
+                    triggered_steps.append(step_desc)
 
             logger.info("Tool-chain batch finished: %d link(s) used of %d budgeted.", tool_calls_used, budget)
 
@@ -1223,35 +1518,41 @@ class AutonomousAgent:
                 ),
             )
 
-            # EXECUTE-phase Human-in-the-Loop detection
-            if triggered_step is not None:
-                proposal = self._enter_pending_approval(triggered_step, "EXECUTE")
+            # EXECUTE-phase Human-in-the-Loop detection.
+            # NON-BLOCKING: every newly gated step is appended to the ledger, then the run
+            # proceeds. Steps already parked during PLAN are de-duplicated automatically.
+            for step_text in triggered_steps:
+                self._register_gate(step_text, "EXECUTE")
+
+            # The only condition that parks the FSM in PENDING_APPROVAL is an empty plan:
+            # with nothing left to execute, the agent settles on the gate before sleeping.
+            if not ctx.active_plan and self.state_manager.pending_proposals():
                 self.state_manager.transition_to(
                     AgentState.PENDING_APPROVAL,
-                    reason="Execution step involves external platform, financial transaction, or asset publishing",
+                    reason="Plan concluded with %d task(s) awaiting dashboard review" % len(self.state_manager.pending_proposals()),
                 )
-                # Instant alerts BEFORE any subsequent SLEEP phase
-                self.notifier.send_alerts(proposal)
-                self.persist_current_state()
-                logger.info("Cycle halted in PENDING_APPROVAL state awaiting dashboard review.")
-                return
 
-            # --- 3. EXECUTE -> EVALUATE (chain summary included) ---
+            # --- 3. EXECUTE -> EVALUATE (chain summary + ledger status included) ---
             self.state_manager.transition_to(AgentState.EVALUATE, reason="Assessing run results")
             chain_notes = ctx.working_memory or getattr(self, "_working_memory", []) or []
             eval_prompt = (
                 f"Completed {len(self.state_manager.context.execution_results)} steps.\n"
                 f"Execution Results: {json.dumps(self.state_manager.context.execution_results)}\n"
                 f"Chained Working Memory: {json.dumps(chain_notes)}\n"
+                f"Proposals Ledger Status: {json.dumps(self.state_manager.ledger_summary())}\n"
                 "Task: Evaluate if milestones succeeded and confirm safe completion."
             )
             eval_monologue = self.generate_monologue(eval_prompt)
             logger.info("Evaluation Monologue:\n%s", eval_monologue)
 
-            # --- 4. EVALUATE -> SLEEP ---
+            # --- 4. EVALUATE -> SLEEP (whole multi-step plan concluded) ---
             self.state_manager.transition_to(AgentState.SLEEP, reason="Cycle finished gracefully")
             self.persist_current_state()
-            logger.info("Agent cycle #%d successfully entered SLEEP mode.", self.state_manager.context.cycle_count)
+            logger.info(
+                "Agent cycle #%d successfully entered SLEEP mode (ledger: %s).",
+                self.state_manager.context.cycle_count,
+                self.state_manager.ledger_summary(),
+            )
 
         except Exception as e:
             logger.critical("Fatal error encountered in execution loop: %s", e, exc_info=True)

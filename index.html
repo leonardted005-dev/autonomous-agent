@@ -33,6 +33,8 @@ tailwind.config = {
   ::-webkit-scrollbar-track { background: #0f172a; }
   ::-webkit-scrollbar-thumb { background: #334155; border-radius: 6px; }
   .glass { background: rgba(15, 23, 42, 0.72); backdrop-filter: blur(10px); }
+  @keyframes ledgerSlide { from { transform: translateY(14px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+  .ledger-card { animation: ledgerSlide .4s ease-out both; }
 </style>
 </head>
 <body class="bg-slate-950 text-slate-200 min-h-screen selection:bg-emerald-500/30">
@@ -149,66 +151,26 @@ tailwind.config = {
       <p id="metricPlatform" class="mt-1 text-lg font-semibold text-violet-400 truncate">—</p>
     </div>
   </section>
-  <!-- Row 3: Proposal alert card -->
-  <section id="proposalCard" class="hidden rounded-2xl border-2 border-amber-500/50 bg-amber-500/[0.06] p-5 md:p-6 animate-popIn">
-    <div class="flex flex-wrap items-start justify-between gap-3">
-      <div class="flex items-start gap-3">
+  <!-- Row 3: Non-blocking proposal ledger -->
+  <section id="ledgerSection" class="hidden">
+    <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+      <div class="flex items-center gap-3">
         <span class="text-2xl">⚠️</span>
         <div>
-          <h2 class="text-lg font-bold text-amber-300">Task Awaiting Your Approval</h2>
-          <p class="text-xs text-amber-200/60">The cloud runner is paused in <span class="mono font-semibold">PENDING_APPROVAL</span> until you decide.</p>
+          <h2 class="text-lg font-bold text-amber-300">Tasks Awaiting Your Approval</h2>
+          <p class="text-xs text-amber-200/60">The cloud runner is <span class="font-semibold">still working</span> — these tasks wait in the <span class="mono">proposals_ledger</span> without blocking it.</p>
         </div>
       </div>
-      <span id="proposalTaskId" class="mono rounded-lg border border-amber-500/40 bg-slate-950 px-3 py-1.5 text-xs text-amber-300">—</span>
+      <span id="ledgerCount" class="mono rounded-lg border border-amber-500/40 bg-slate-950 px-3 py-1.5 text-xs text-amber-300">0 pending</span>
     </div>
-
-    <div class="mt-5 grid grid-cols-1 md:grid-cols-3 gap-4">
-      <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
-        <p class="text-[11px] uppercase tracking-widest text-slate-500">Platform</p>
-        <p id="proposalPlatform" class="mt-1 text-base font-semibold text-white">—</p>
-      </div>
-      <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
-        <p class="text-[11px] uppercase tracking-widest text-slate-500">Type</p>
-        <p id="proposalType" class="mt-1 text-base font-semibold text-white">—</p>
-      </div>
-      <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
-        <p class="text-[11px] uppercase tracking-widest text-slate-500">Expected Revenue</p>
-        <p id="proposalRevenue" class="mono mt-1 text-base font-semibold text-emerald-400">—</p>
-      </div>
-    </div>
-
-    <div class="mt-4 rounded-xl border border-slate-800 bg-slate-950/70 p-4">
-      <p class="text-[11px] uppercase tracking-widest text-slate-500 mb-1">Proposed Action</p>
-      <p id="proposalAction" class="text-sm leading-relaxed text-slate-300 whitespace-pre-wrap">—</p>
-    </div>
-
-    <div class="mt-4">
-      <p class="text-[11px] uppercase tracking-widest text-slate-500 mb-2">Generated Code / Files Preview</p>
-      <div id="proposalFiles" class="space-y-3"></div>
-    </div>
-
-    <div class="mt-4">
-      <label for="inputInjectedCookies" class="text-[11px] uppercase tracking-widest text-slate-500 mb-2 block">Injected Cookie String <span class="normal-case tracking-normal text-slate-600">(optional · your session, never your password)</span></label>
-      <textarea id="inputInjectedCookies" rows="2" placeholder="sessionid=abc123; csrftoken=xyz789; _ga=GA1.2..." spellcheck="false"
-        class="mono w-full rounded-xl border border-slate-800 bg-slate-950/70 p-3 text-xs text-slate-300 placeholder-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500/40"></textarea>
-      <p class="mt-1 text-[11px] text-slate-600">Sign in on your own PC, copy the Cookie header from DevTools → Network, and paste it here. Clicking APPROVE stores it in the Gist so the agent wakes up logged in — it never sees your passwords.</p>
-      <p id="sessionBadge" class="hidden mt-2 inline-flex items-center gap-1.5 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-400">🍪 Session active</p>
-    </div>
-
-    <div id="decisionArea" class="mt-6 flex flex-col sm:flex-row gap-3">
-      <button id="approveBtn" class="flex-1 rounded-xl bg-emerald-500 px-6 py-4 text-base font-bold text-slate-950 shadow-lg shadow-emerald-500/25 hover:bg-emerald-400 active:scale-[.98] transition">🟢 APPROVE TASK</button>
-      <button id="denyBtn" class="flex-1 rounded-xl bg-red-500 px-6 py-4 text-base font-bold text-white shadow-lg shadow-red-500/25 hover:bg-red-400 active:scale-[.98] transition">🔴 DENY TASK</button>
-    </div>
-    <div id="decisionSuccess" class="hidden mt-6 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-4 animate-slideUp">
-      <p id="decisionSuccessText" class="text-sm font-semibold text-emerald-300"></p>
-    </div>
+    <div id="ledgerList" class="space-y-5"></div>
   </section>
 
   <!-- Empty state -->
   <section id="emptyState" class="rounded-2xl border border-dashed border-slate-800 bg-slate-900/40 p-8 text-center">
     <p class="text-3xl">🛰️</p>
     <h2 class="mt-2 font-semibold text-slate-300">No active proposal</h2>
-    <p class="mt-1 text-sm text-slate-500">The agent is running autonomously. A proposal card will appear here the moment it enters <span class="mono text-amber-400">PENDING_APPROVAL</span>.</p>
+    <p class="mt-1 text-sm text-slate-500">The agent is running autonomously. Tasks appear here the moment they enter <span class="mono text-amber-400">PENDING_APPROVAL</span>.</p>
   </section>
 </main>
 
@@ -395,26 +357,60 @@ function renderTracker(stateName) {
   badge.textContent = stateName || "UNKNOWN";
   badge.className = `rounded-full border px-3 py-1 text-[11px] font-bold tracking-wide ${badgeClassFor(stateName)}`;
 }
-/* ---------- Proposal render engine ---------- */
+/* ---------- Proposal ledger render engine ---------- */
 let currentStateDoc = null;
-function renderProposal(proposal, decision) {
-  document.getElementById("proposalTaskId").textContent = proposal.task_id || "—";
-  document.getElementById("proposalPlatform").textContent = proposal.target_platform || "TBD";
-  document.getElementById("proposalType").textContent = proposal.type || "—";
-  document.getElementById("proposalRevenue").textContent = proposal.estimated_revenue || "TBD";
-  document.getElementById("proposalAction").textContent = proposal.proposed_action || "—";
 
-  const filesBox = document.getElementById("proposalFiles");
-  filesBox.innerHTML = "";
-  const files = Array.isArray(proposal.generated_files) ? proposal.generated_files : [];
-  if (!files.length) {
+/* Normalizes the persisted state into the global ledger array.
+   Prefers the top-level `proposals_ledger`; falls back to a ledger mirrored inside
+   `context_data`, and finally to a legacy single `pending_proposal` entry. */
+function collectLedger(state) {
+  const ctx = (state && state.context_data) || {};
+  let ledger = state && state.proposals_ledger;
+  if (!Array.isArray(ledger)) ledger = ctx.proposals_ledger;
+  if (!Array.isArray(ledger)) ledger = [];
+  ledger = ledger.filter((e) => e && typeof e === "object");
+
+  // Legacy single-task states: fold the old blocking pending_proposal into the ledger.
+  if (!ledger.length && ctx.pending_proposal && typeof ctx.pending_proposal === "object") {
+    const legacy = Object.assign({}, ctx.pending_proposal);
+    legacy.status = legacy.status || "PENDING_APPROVAL";
+    if (legacy.human_decision == null && ctx.human_decision != null) {
+      legacy.human_decision = ctx.human_decision;
+    }
+    ledger = [legacy];
+  }
+  return ledger;
+}
+
+function pendingLedger(state) {
+  return collectLedger(state).filter((e) => String(e.status || "").toUpperCase() === "PENDING_APPROVAL");
+}
+
+/* Case-insensitive, whitespace-tolerant decision reading, mirroring the Python gate. */
+function normalizedDecision(entry) {
+  if (!entry || entry.human_decision == null) return "";
+  return String(entry.human_decision).trim().toUpperCase();
+}
+
+function renderFilePreviews(files) {
+  const wrap = document.createElement("div");
+  wrap.className = "mt-4";
+  const label = document.createElement("p");
+  label.className = "text-[11px] uppercase tracking-widest text-slate-500 mb-2";
+  label.textContent = "Generated Code / Files Preview";
+  wrap.appendChild(label);
+
+  const filesBox = document.createElement("div");
+  filesBox.className = "space-y-3";
+  const list = Array.isArray(files) ? files : [];
+  if (!list.length) {
     filesBox.innerHTML = `<p class="text-xs text-slate-600">No files generated for this task yet.</p>`;
   } else {
-    files.slice(0, 5).forEach((f) => {
+    list.slice(0, 5).forEach((f) => {
       const full = String(f.content ?? "");
       const code = full.length > 1500 ? full.slice(0, 1500) + "\n… (truncated)" : full;
       const box = document.createElement("div");
-      box.className = "rounded-xl border border-slate-800 bg-slate-950 overflow-hidden animate-slideUp";
+      box.className = "rounded-xl border border-slate-800 bg-slate-950 overflow-hidden";
       box.innerHTML =
         `<div class="flex items-center justify-between border-b border-slate-800 px-3 py-2">
            <span class="mono text-xs text-sky-300">${esc(f.name)}</span>
@@ -424,65 +420,155 @@ function renderProposal(proposal, decision) {
       filesBox.appendChild(box);
     });
   }
+  wrap.appendChild(filesBox);
+  return wrap;
+}
 
-  const area = document.getElementById("decisionArea");
-  const success = document.getElementById("decisionSuccess");
-  const successText = document.getElementById("decisionSuccessText");
-  const decideBtns = [document.getElementById("approveBtn"), document.getElementById("denyBtn")];
-  decideBtns.forEach((b) => (b.disabled = false));
-  document.getElementById("approveBtn").innerHTML = "🟢 APPROVE TASK";
-  document.getElementById("denyBtn").innerHTML = "🔴 DENY TASK";
+/* Builds one ledger card per task, with its own APPROVE / DENY controls. */
+function renderLedgerCard(entry, activeCookies) {
+  const taskId = entry.task_id || "—";
+  const decision = normalizedDecision(entry);
+  const card = document.createElement("div");
+  card.className = "ledger-card rounded-2xl border-2 border-amber-500/50 bg-amber-500/[0.06] p-5 md:p-6";
 
-  // Cookie handshake field: reset per proposal, mirror any active session.
-  const cookieBox = document.getElementById("inputInjectedCookies");
-  if (cookieBox) cookieBox.value = "";
+  const head = document.createElement("div");
+  head.className = "flex flex-wrap items-start justify-between gap-3";
+  head.innerHTML =
+    `<div class="flex items-start gap-3">
+       <span class="text-2xl">⚠️</span>
+       <div>
+         <h3 class="text-base font-bold text-amber-300">Task Awaiting Your Approval</h3>
+         <p class="text-xs text-amber-200/60">Queued as <span class="mono font-semibold">PENDING_APPROVAL</span> — the agent keeps running.</p>
+       </div>
+     </div>
+     <span class="mono rounded-lg border border-amber-500/40 bg-slate-950 px-3 py-1.5 text-xs text-amber-300">${esc(taskId)}</span>`;
+  card.appendChild(head);
+
+  const grid = document.createElement("div");
+  grid.className = "mt-5 grid grid-cols-1 md:grid-cols-3 gap-4";
+  [
+    ["Platform", entry.target_platform || "TBD", "text-white"],
+    ["Type", entry.type || "—", "text-white"],
+    ["Expected Revenue", entry.estimated_revenue || "TBD", "mono text-emerald-400"],
+  ].forEach(([label, value, cls]) => {
+    const cell = document.createElement("div");
+    cell.className = "rounded-xl border border-slate-800 bg-slate-950/70 p-4";
+    cell.innerHTML =
+      `<p class="text-[11px] uppercase tracking-widest text-slate-500">${esc(label)}</p>
+       <p class="mt-1 text-base font-semibold ${cls}">${esc(value)}</p>`;
+    grid.appendChild(cell);
+  });
+  card.appendChild(grid);
+
+  const actionBox = document.createElement("div");
+  actionBox.className = "mt-4 rounded-xl border border-slate-800 bg-slate-950/70 p-4";
+  actionBox.innerHTML =
+    `<p class="text-[11px] uppercase tracking-widest text-slate-500 mb-1">Proposed Action</p>
+     <p class="text-sm leading-relaxed text-slate-300 whitespace-pre-wrap">${esc(entry.proposed_action || "—")}</p>`;
+  card.appendChild(actionBox);
+
+  if (entry.requires_account) {
+    const acct = document.createElement("div");
+    acct.className = "mt-4 rounded-xl border border-sky-500/40 bg-sky-500/10 p-4";
+    acct.innerHTML =
+      `<p class="text-[11px] uppercase tracking-widest text-sky-400 mb-1">Account Wall Detected</p>
+       <p class="text-sm text-sky-200">This platform demands registration or verification. Sign up yourself at
+       <a class="mono underline hover:text-sky-100" href="${esc(entry.registration_link || "#")}" target="_blank" rel="noopener noreferrer">${esc(entry.registration_link || "TBD")}</a>,
+       then paste your session cookies below and approve.</p>`;
+    card.appendChild(acct);
+  }
+
+  card.appendChild(renderFilePreviews(entry.generated_files));
+
+  const cookieWrap = document.createElement("div");
+  cookieWrap.className = "mt-4";
+  const cookieHint = document.createElement("p");
+  cookieHint.className = "mt-1 text-[11px] text-slate-600";
+  cookieHint.textContent =
+    "Sign in on your own PC, copy the Cookie header from DevTools → Network, and paste it here. " +
+    "Approving stores it as top-level session_cookies so the agent wakes up logged in — it never sees your passwords.";
+  cookieWrap.innerHTML =
+    `<label class="text-[11px] uppercase tracking-widest text-slate-500 mb-2 block">
+       Injected Cookie String <span class="normal-case tracking-normal text-slate-600">(optional · your session, never your password)</span>
+     </label>
+     <textarea rows="2" spellcheck="false" data-cookie-input="${esc(taskId)}"
+       placeholder="sessionid=abc123; csrftoken=xyz789; _ga=GA1.2..."
+       class="mono w-full rounded-xl border border-slate-800 bg-slate-950/70 p-3 text-xs text-slate-300 placeholder-slate-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500/40"></textarea>`;
+  cookieWrap.appendChild(cookieHint);
+  const badge = document.createElement("p");
+  badge.className = "mt-2 inline-flex items-center gap-1.5 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-400";
+  const cookieNames = Object.keys(activeCookies || {});
+  badge.textContent = cookieNames.length ? `🍪 Session active · ${cookieNames.length} cookie(s)` : "🍪 No session yet";
+  cookieWrap.appendChild(badge);
+  card.appendChild(cookieWrap);
+
+  const area = document.createElement("div");
+  area.className = "mt-6 flex flex-col sm:flex-row gap-3";
+  const success = document.createElement("div");
+  success.className = "hidden mt-6 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-4";
+  const successText = document.createElement("p");
+  successText.className = "text-sm font-semibold text-emerald-300";
+  success.appendChild(successText);
+
   if (decision) {
     area.classList.add("hidden");
+    success.classList.remove("hidden");
     successText.textContent =
       decision === "APPROVED"
-        ? "✅ APPROVED — the cloud runner will execute this task on the next 30-minute cron cycle."
-        : "🚫 DENIED — the task will be cleared and the agent will return to planning on its next wake-up.";
-    success.classList.remove("hidden");
+        ? "✅ APPROVED — the cloud runner will execute this task on its next wake-up."
+        : "🚫 DENIED — this task is purged from the ledger on the next wake-up.";
   } else {
-    success.classList.add("hidden");
-    area.classList.remove("hidden");
+    const approveBtn = document.createElement("button");
+    approveBtn.className = "flex-1 rounded-xl bg-emerald-500 px-6 py-4 text-base font-bold text-slate-950 shadow-lg shadow-emerald-500/25 hover:bg-emerald-400 active:scale-[.98] transition";
+    approveBtn.textContent = "🟢 APPROVE TASK";
+    approveBtn.addEventListener("click", () => decide(taskId, "APPROVED"));
+
+    const denyBtn = document.createElement("button");
+    denyBtn.className = "flex-1 rounded-xl bg-red-500 px-6 py-4 text-base font-bold text-white shadow-lg shadow-red-500/25 hover:bg-red-400 active:scale-[.98] transition";
+    denyBtn.textContent = "🔴 DENY TASK";
+    denyBtn.addEventListener("click", () => decide(taskId, "DENIED"));
+
+    area.appendChild(approveBtn);
+    area.appendChild(denyBtn);
   }
+
+  card.appendChild(area);
+  card.appendChild(success);
+  return card;
 }
 
 function renderState(state) {
-  const ctx = state.context_data || {};
-  const proposal = ctx.pending_proposal || null;
-  const pending = state.current_state === "PENDING_APPROVAL" && proposal;
+  const ledger = collectLedger(state);
+  const pending = pendingLedger(state);
 
   renderTracker(state.current_state);
   document.getElementById("metricCycles").textContent = state.cycle_count ?? "—";
-  document.getElementById("metricRevenue").textContent = pending ? (proposal.estimated_revenue || "TBD") : "—";
-  document.getElementById("metricType").textContent = pending ? (proposal.type || "—") : "—";
-  document.getElementById("metricPlatform").textContent = pending ? (proposal.target_platform || "—") : "—";
+  document.getElementById("metricRevenue").textContent = pending.length ? (pending[0].estimated_revenue || "TBD") : "—";
+  document.getElementById("metricType").textContent = pending.length ? (pending[0].type || "—") : "—";
+  document.getElementById("metricPlatform").textContent = pending.length ? (pending[0].target_platform || "—") : "—";
   document.getElementById("stateReason").textContent =
-    `Updated ${state.last_updated || "—"} · run ${state.run_id || "—"}`;
+    `Updated ${state.last_updated || "—"} · run ${state.run_id || "—"} · ledger ${ledger.length} task(s), ${pending.length} awaiting`;
 
-  // Invisible cookie-session handshake status (names only, values never shown).
   const sessionBadge = document.getElementById("sessionBadge");
   const cookies = state.session_cookies && typeof state.session_cookies === "object" ? state.session_cookies : {};
-  const cookieNames = Object.keys(cookies);
   if (sessionBadge) {
-    if (cookieNames.length) {
-      sessionBadge.textContent = `🍪 Session active · ${cookieNames.length} cookie(s)`;
-      sessionBadge.classList.remove("hidden");
-    } else {
-      sessionBadge.classList.add("hidden");
-    }
+    if (Object.keys(cookies).length) sessionBadge.classList.remove("hidden");
+    else sessionBadge.classList.add("hidden");
   }
 
-  const card = document.getElementById("proposalCard");
+  const section = document.getElementById("ledgerSection");
+  const list = document.getElementById("ledgerList");
   const empty = document.getElementById("emptyState");
-  if (pending) {
-    renderProposal(proposal, ctx.human_decision || null);
-    card.classList.remove("hidden");
+  const count = document.getElementById("ledgerCount");
+
+  list.innerHTML = "";
+  if (pending.length) {
+    count.textContent = `${pending.length} pending`;
+    pending.forEach((entry) => list.appendChild(renderLedgerCard(entry, cookies)));
+    section.classList.remove("hidden");
     empty.classList.add("hidden");
   } else {
-    card.classList.add("hidden");
+    section.classList.add("hidden");
     empty.classList.remove("hidden");
   }
 }
@@ -522,8 +608,8 @@ async function refresh() {
   }
 }
 
-/* ---------- 1-Button Controls: APPROVE / DENY ---------- */
-async function decide(decision) {
+/* ---------- 1-Button Controls: APPROVE / DENY (per ledger task) ---------- */
+async function decide(taskId, decision) {
   const cfg = getConfig();
   if (!cfg.gistId || !cfg.token) {
     showToast("error", "Configure GIST_ID and GIT_TOKEN in Settings first.");
@@ -533,60 +619,64 @@ async function decide(decision) {
     showToast("error", "No state loaded — refresh first.");
     return;
   }
-  const approveBtn = document.getElementById("approveBtn");
-  const denyBtn = document.getElementById("denyBtn");
-  approveBtn.disabled = true;
-  denyBtn.disabled = true;
-  approveBtn.innerHTML = "⏳ Saving…";
-  denyBtn.innerHTML = "⏳ Saving…";
   try {
     const updated = JSON.parse(JSON.stringify(currentStateDoc));
     updated.context_data = updated.context_data || {};
+
+    // Work on the same ledger the renderer built, then persist it back in BOTH the
+    // top-level array (canonical) and context_data (mirror for older readers).
+    const ledger = collectLedger(updated);
+    const target = ledger.find((e) => String(e.task_id) === String(taskId));
+    if (!target) {
+      showToast("error", `Task ${taskId} is no longer in the ledger — refresh.`);
+      return;
+    }
+    target.human_decision = decision;
+    if (decision === "DENIED") target.status = "DENIED";
+
+    // Keep the legacy single-task fields coherent so an older runner still sees
+    // exactly one actionable gate (the most recent pending task).
+    const newestPending = ledger.filter((e) => String(e.status || "").toUpperCase() === "PENDING_APPROVAL").pop() || null;
+    updated.context_data.pending_proposal = newestPending || target;
     updated.context_data.human_decision = decision;
-    updated.last_updated = new Date().toISOString();
 
     // Invisible cookie-session handshake: on APPROVE, persist any pasted cookies
     // as top-level session state (name/value pairs only — never passwords).
+    let cookieNote = "";
     if (decision === "APPROVED") {
-      const rawCookies = (document.getElementById("inputInjectedCookies") || {}).value || "";
+      const box = document.querySelector(`[data-cookie-input="${taskId}"]`)
+        || document.getElementById("inputInjectedCookies");
+      const rawCookies = (box || {}).value || "";
       const parsed = parseCookieString(rawCookies);
       if (Object.keys(parsed).length) {
         updated.session_cookies = Object.assign({}, updated.session_cookies || {}, parsed);
       }
+      const savedCookies = Object.keys(updated.session_cookies || {}).length;
+      cookieNote = savedCookies ? " 🍪 Session cookies saved — agent wakes up logged in." : "";
     }
+
+    updated.proposals_ledger = ledger;
+    updated.context_data.proposals_ledger = ledger;
+    updated.last_updated = new Date().toISOString();
 
     const filename = stateFileName(cfg.agentId);
     await GitHubAPI.patchGistFile(cfg.gistId, cfg.token, filename, JSON.stringify(updated, null, 2));
     currentStateDoc = updated;
     renderState(updated);
-    const savedCookies = Object.keys(updated.session_cookies || {}).length;
-    const cookieNote = savedCookies
-      ? " 🍪 Session cookies saved — agent wakes up logged in."
-      : "";
-    // Reinforce the handshake in the in-card success banner as well as the toast.
-    if (cookieNote) {
-      const successEl = document.getElementById("decisionSuccessText");
-      if (successEl) successEl.textContent += cookieNote;
-    }
+
     showToast(
       "success",
       decision === "APPROVED"
-        ? "✅ Approved! Cloud runner will execute on the next 30-minute cron cycle." + cookieNote
-        : "🚫 Denied. Task will be cleared on the agent's next wake-up."
+        ? `✅ Approved task ${taskId}! The runner will execute it on its next wake-up.` + cookieNote
+        : `🚫 Denied task ${taskId}. It will be purged from the ledger on the next wake-up.`
     );
   } catch (e) {
-    approveBtn.disabled = false;
-    denyBtn.disabled = false;
-    approveBtn.innerHTML = "🟢 APPROVE TASK";
-    denyBtn.innerHTML = "🔴 DENY TASK";
     showToast("error", `Decision failed: ${e.message}`);
   }
 }
 
 /* ---------- Wiring & boot ---------- */
 document.getElementById("refreshBtn").addEventListener("click", refresh);
-document.getElementById("approveBtn").addEventListener("click", () => decide("APPROVED"));
-document.getElementById("denyBtn").addEventListener("click", () => decide("DENIED"));
 
 hydrateSettings();
 renderTracker(null);

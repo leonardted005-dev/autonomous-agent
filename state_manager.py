@@ -9,6 +9,17 @@ The agent transitions sequentially through lifecycle states:
 
 Each state change is validated against allowed transitions to prevent invalid execution paths
 and ensure complete determinism across ephemeral worker instances.
+
+Non-Blocking Multi-Task Proposal Ledger
+---------------------------------------
+Requesting human approval no longer freezes the whole lifecycle. Instead of holding a
+single blocking `pending_proposal`, the context maintains a persistent global array named
+`proposals_ledger`. When a task needs human intervention, an account wall, or external
+publishing, it is appended to the ledger with a unique ID and a status of
+`PENDING_APPROVAL`; the agent immediately continues its remaining pipeline steps within
+the same run. The FSM only settles into SLEEP once its entire multi-step plan for the
+cycle has concluded, so many verifications can wait on the dashboard simultaneously while
+the agent keeps exploring new opportunities.
 """
 
 from __future__ import annotations
@@ -36,15 +47,31 @@ class AgentState(str, Enum):
 # Strict map of allowed directional transitions between states.
 # PENDING_APPROVAL is entered from PLAN/EXECUTE when a task touches external
 # platforms, financial transactions, or asset publishing (Human-in-the-Loop gate).
+#
+# With the Non-Blocking Multi-Task Proposal Ledger the gate is advisory only: a cycle
+# may park tasks in PENDING_APPROVAL and keep flowing through EXECUTE -> EVALUATE -> SLEEP
+# without halting, so PENDING_APPROVAL is reachable from every working state and may
+# return to any of them.
 ALLOWED_TRANSITIONS: Dict[AgentState, List[AgentState]] = {
-    AgentState.WAKE_UP: [AgentState.PLAN, AgentState.ERROR, AgentState.SLEEP],
+    AgentState.WAKE_UP: [AgentState.PLAN, AgentState.PENDING_APPROVAL, AgentState.ERROR, AgentState.SLEEP],
     AgentState.PLAN: [AgentState.EXECUTE, AgentState.EVALUATE, AgentState.PENDING_APPROVAL, AgentState.ERROR, AgentState.SLEEP],
     AgentState.EXECUTE: [AgentState.EVALUATE, AgentState.PLAN, AgentState.PENDING_APPROVAL, AgentState.ERROR, AgentState.SLEEP],
-    AgentState.EVALUATE: [AgentState.PLAN, AgentState.SLEEP, AgentState.ERROR],
-    AgentState.PENDING_APPROVAL: [AgentState.PLAN, AgentState.EXECUTE, AgentState.SLEEP, AgentState.ERROR, AgentState.WAKE_UP],
+    AgentState.EVALUATE: [AgentState.PLAN, AgentState.EXECUTE, AgentState.PENDING_APPROVAL, AgentState.SLEEP, AgentState.ERROR],
+    AgentState.PENDING_APPROVAL: [AgentState.PLAN, AgentState.EXECUTE, AgentState.EVALUATE, AgentState.SLEEP, AgentState.ERROR, AgentState.WAKE_UP],
     AgentState.SLEEP: [AgentState.WAKE_UP],
     AgentState.ERROR: [AgentState.SLEEP],  # Graceful wind-down after failure logging
 }
+
+
+class ProposalStatus(str, Enum):
+    """Lifecycle of a single entry in the global proposals_ledger."""
+    PENDING_APPROVAL = "PENDING_APPROVAL"
+    COMPLETED = "COMPLETED"
+    DENIED = "DENIED"
+
+
+# Backwards-compatible alias retained for callers importing the plural name.
+ProposalState = ProposalStatus
 
 
 @dataclass
@@ -72,6 +99,10 @@ class AgentContext:
     working_memory: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     history: List[Dict[str, Any]] = field(default_factory=list)
+    # Persistent global multi-task ledger. Replaces the old single blocking
+    # `pending_proposal` dictionary: any number of tasks may wait here for human
+    # verification while the agent keeps executing the rest of its pipeline.
+    proposals_ledger: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes context to a plain JSON-compatible dictionary."""
@@ -85,6 +116,7 @@ class AgentContext:
             "working_memory": self.working_memory,
             "errors": self.errors,
             "history": self.history,
+            "proposals_ledger": self.proposals_ledger,
         }
 
     @classmethod
@@ -96,6 +128,12 @@ class AgentContext:
         except ValueError:
             current_state = AgentState.WAKE_UP
 
+        raw_ledger = data.get("proposals_ledger", [])
+        ledger = (
+            [dict(entry) for entry in raw_ledger if isinstance(entry, dict)]
+            if isinstance(raw_ledger, list) else []
+        )
+
         return cls(
             run_id=data.get("run_id", "unknown_run"),
             cycle_count=data.get("cycle_count", 0),
@@ -106,6 +144,7 @@ class AgentContext:
             working_memory=data.get("working_memory", []),
             errors=data.get("errors", []),
             history=data.get("history", []),
+            proposals_ledger=ledger,
         )
 
 
@@ -190,3 +229,100 @@ class StateManager:
         self.context.execution_results.clear()
         self.context.working_memory.clear()
         logger.info("Context reset for new cycle #%d", self.context.cycle_count)
+
+    # ------------------------------------------------------------------
+    # Non-Blocking Multi-Task Proposal Ledger
+    # ------------------------------------------------------------------
+
+    @property
+    def proposals_ledger(self) -> List[Dict[str, Any]]:
+        """The persistent global array of human-gated tasks for this agent."""
+        ledger = getattr(self.context, "proposals_ledger", None)
+        if not isinstance(ledger, list):
+            ledger = []
+            self.context.proposals_ledger = ledger
+        return ledger
+
+    def append_proposal(self, proposal: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Appends a task to the global ledger with a unique ID and a
+        `PENDING_APPROVAL` status. Never blocks: the caller continues its plan.
+        An entry that already carries a task_id is not duplicated.
+        """
+        entry = dict(proposal)
+        task_id = str(entry.get("task_id") or entry.get("id") or "").strip()
+        if not task_id:
+            task_id = hashlib_short_id(entry)
+        entry["task_id"] = task_id
+        entry["status"] = ProposalStatus.PENDING_APPROVAL.value
+        # A fresh entry always starts undecided; the human sets this per task.
+        entry.setdefault("human_decision", None)
+
+        for existing in self.proposals_ledger:
+            if isinstance(existing, dict) and existing.get("task_id") == task_id:
+                logger.info("Proposal %s already present in ledger; keeping existing entry.", task_id)
+                return existing
+
+        self.proposals_ledger.append(entry)
+        logger.info(
+            "Ledger append: task %s (%s) queued as PENDING_APPROVAL. Ledger depth now %d.",
+            task_id, entry.get("type", "Task"), len(self.proposals_ledger),
+        )
+        return entry
+
+    def get_proposal(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Looks up a single ledger entry by its unique task ID."""
+        for entry in self.proposals_ledger:
+            if isinstance(entry, dict) and entry.get("task_id") == task_id:
+                return entry
+        return None
+
+    def remove_proposal(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Purges a single ledger entry (used when a task is DENIED or COMPLETED)."""
+        for index, entry in enumerate(self.proposals_ledger):
+            if isinstance(entry, dict) and entry.get("task_id") == task_id:
+                removed = self.proposals_ledger.pop(index)
+                logger.info("Ledger purge: task %s removed from active array.", task_id)
+                return removed
+        return None
+
+    def purge_proposals(self, status: str) -> List[Dict[str, Any]]:
+        """Removes every ledger entry matching a status and returns the purged entries."""
+        target = str(status).strip().upper()
+        purged = [e for e in self.proposals_ledger if str(e.get("status")).upper() == target]
+        if purged:
+            self.context.proposals_ledger = [
+                e for e in self.proposals_ledger if str(e.get("status")).upper() != target
+            ]
+            logger.info("Ledger purge: removed %d entr(ies) with status %s.", len(purged), target)
+        return purged
+
+    def pending_proposals(self) -> List[Dict[str, Any]]:
+        """Returns every ledger entry still awaiting a human decision."""
+        return [
+            e for e in self.proposals_ledger
+            if str(e.get("status", "")).strip().upper() == ProposalStatus.PENDING_APPROVAL.value
+        ]
+
+    def ledger_summary(self) -> Dict[str, int]:
+        """Compact status histogram used in prompts, logs, and the dashboard."""
+        summary: Dict[str, int] = {}
+        for entry in self.proposals_ledger:
+            key = str(entry.get("status", "UNKNOWN")).strip().upper() or "UNKNOWN"
+            summary[key] = summary.get(key, 0) + 1
+        return summary
+
+
+def hashlib_short_id(entry: Dict[str, Any]) -> str:
+    """
+    Derives a stable 12-char identifier for a ledger entry that arrives without one.
+    Uses only the standard library so the FSM layer stays dependency-free.
+    """
+    import hashlib
+    import json as _json
+
+    try:
+        blob = _json.dumps(entry, sort_keys=True, default=str)
+    except Exception:
+        blob = str(entry)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
