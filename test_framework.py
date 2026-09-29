@@ -670,8 +670,131 @@ class TestHumanInTheLoop(unittest.TestCase):
         self.assertEqual(stored["status"], "PENDING_APPROVAL")
         self.assertIsNone(stored["human_decision"])
 
+    # ------------------------------------------------------------------
+    # Dynamic content injection ([LAST_BROWSER_OUTPUT])
+    # ------------------------------------------------------------------
+
+    def _mock_get(self, body: str):
+        """Context manager patching urllib for a single successful GET."""
+        from unittest.mock import MagicMock, patch as _patch
+        patcher = _patch("urllib.request.urlopen")
+        mock_urlopen = patcher.start()
+        self.addCleanup(patcher.stop)
+        resp = MagicMock()
+        resp.status = 200
+        resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+        resp.read.return_value = body.encode("utf-8")
+        resp.__enter__.return_value = resp
+        mock_urlopen.return_value = resp
+        return mock_urlopen
+
+    def test_injection_token_pipes_browser_output_into_file(self):
+        # The exact regression: a web read followed by a file write in one run must
+        # produce a populated file, not an empty '[]'.
+        self._mock_get("<html><body><h1>Market Feed</h1><p>AI Engineer contract.</p></body></html>")
+        self.agent.initialize_state()
+        step = (
+            '1. TOOL_CALL: web_browser_tool {"url": "https://jobs.example/feed"} '
+            'TOOL_CALL: file_writer_tool {"filepath": "snapshot.txt", "content": "[LAST_BROWSER_OUTPUT]"}'
+        )
+        result = self.agent._parse_and_execute_step(step)
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(len(result["tool_calls"]), 2)
+        browser_call, writer_call = result["tool_calls"]
+        self.assertEqual(browser_call["status"], "SUCCESS")
+        self.assertEqual(writer_call["status"], "SUCCESS")
+        self.assertTrue(writer_call["tool_output"]["injected_last_browser_output"])
+
+        path = os.path.join(self.test_dir, "snapshot.txt")
+        written = open(path, encoding="utf-8").read()
+        self.assertGreater(os.path.getsize(path), 2)
+        self.assertIn("Market Feed", written)
+        self.assertIn("AI Engineer contract", written)
+        # Placeholder fully substituted; markup/scripts stripped by the browser tool.
+        self.assertNotIn("[LAST_BROWSER_OUTPUT]", written)
+
+    def test_injection_tracks_only_the_most_recent_successful_read(self):
+        # A later successful read must overwrite the tracker.
+        self._mock_get("<html><body>Page One</body></html>")
+        self.agent.initialize_state()
+        self.agent._parse_and_execute_step('1. TOOL_CALL: web_browser_tool {"url": "https://a.example/1"}')
+        self.assertIn("Page One", self.agent.toolbox.last_browser_result)
+
+        self._mock_get("<html><body>Page Two</body></html>")
+        self.agent._parse_and_execute_step('1. TOOL_CALL: web_browser_tool {"url": "https://b.example/2"}')
+        self.assertIn("Page Two", self.agent.toolbox.last_browser_result)
+        self.assertNotIn("Page One", self.agent.toolbox.last_browser_result)
+
+    def test_injection_token_without_prior_read_errors_clearly(self):
+        # No silent empty write: the tool must refuse and explain what to do.
+        self.agent.initialize_state()
+        self.assertIsNone(self.agent.toolbox.last_browser_result)
+        result = self.agent._parse_and_execute_step(
+            '1. TOOL_CALL: file_writer_tool {"filepath": "empty.txt", "content": "[LAST_BROWSER_OUTPUT]"}'
+        )
+        self.assertEqual(result["status"], "ERROR")
+        call = result["tool_calls"][0]
+        self.assertEqual(call["status"], "ERROR")
+        self.assertIn("web_browser_tool", call["tool_output"]["error"])
+        self.assertFalse(os.path.exists(os.path.join(self.test_dir, "empty.txt")))
+
+    def test_injection_failed_read_does_not_populate_tracker(self):
+        import io
+        import urllib.error
+        from unittest.mock import patch as _patch
+        self.agent.initialize_state()
+        with _patch("urllib.request.urlopen") as mock_urlopen:
+            mock_urlopen.side_effect = urllib.error.HTTPError(
+                "https://x.example", 500, "Server Error", {}, io.BytesIO(b"boom")
+            )
+            result = self.agent._parse_and_execute_step('1. TOOL_CALL: web_browser_tool {"url": "https://x.example"}')
+        self.assertEqual(result["tool_calls"][0]["status"], "ERROR")
+        # A failed fetch must not leave a stale/empty payload behind.
+        self.assertIsNone(self.agent.toolbox.last_browser_result)
+
+    def test_injection_placeholder_can_be_embedded_in_larger_content(self):
+        self._mock_get("<html><body>Payload Body</body></html>")
+        self.agent.initialize_state()
+        step = (
+            '1. TOOL_CALL: web_browser_tool {"url": "https://jobs.example/feed"} '
+            'TOOL_CALL: file_writer_tool {"filepath": "report.md", "content": "# Report\\n\\n[LAST_BROWSER_OUTPUT]"}'
+        )
+        result = self.agent._parse_and_execute_step(step)
+        self.assertEqual(result["status"], "COMPLETED")
+        written = open(os.path.join(self.test_dir, "report.md"), encoding="utf-8").read()
+        self.assertTrue(written.startswith("# Report"))
+        self.assertIn("Payload Body", written)
+        self.assertNotIn("[LAST_BROWSER_OUTPUT]", written)
+
+    def test_injection_tracker_cleared_between_cycles(self):
+        # Per-run scoping: a stale payload must never leak into the next cycle.
+        self._mock_get("<html><body>Cycle One Data</body></html>")
+        self.agent.initialize_state()
+        self.agent._parse_and_execute_step('1. TOOL_CALL: web_browser_tool {"url": "https://jobs.example/feed"}')
+        self.assertIsNotNone(self.agent.toolbox.last_browser_result)
+
+        # A fresh wake-up (new cycle) resets the tracker.
+        self.agent.initialize_state()
+        self.assertIsNone(self.agent.toolbox.last_browser_result)
+
+    def test_injection_is_advertised_in_system_prompt(self):
+        # The model must be told the exact token to emit.
+        captured = {}
+
+        def fake_completion(messages, temperature=0.2):
+            captured["system"] = messages[0]["content"]
+            return "THINKING PROCESS:\nx\nSTEP-BY-STEP PLAN:\n1. noop\nEXECUTION ASSESSMENT:\nok"
+
+        self.agent.llm.generate_completion = fake_completion
+        self.agent.initialize_state()
+        self.agent.generate_monologue("plan something")
+        system_prompt = captured["system"]
+        self.assertIn("[LAST_BROWSER_OUTPUT]", system_prompt)
+        lowered = system_prompt.lower()
+        self.assertIn("web_browser_tool", lowered)
+        self.assertIn("content", lowered)
+
     def test_multi_tool_chain_batch_execution(self):
-        # A single step may carry several TOOL_CALL links; all run in one cycle.
         step = (
             '1. TOOL_CALL: file_writer_tool {"filepath": "chain_a.txt", "content": "first"} '
             'TOOL_CALL: file_writer_tool {"filepath": "chain_b.txt", "content": "second"} '
@@ -1080,6 +1203,89 @@ class TestToolbox(unittest.TestCase):
         self.assertEqual(res["status"], "SUCCESS")
         unknown = self.toolbox.execute_tool("non_existent_tool", {})
         self.assertEqual(unknown["status"], "ERROR")
+
+    # ------------------------------------------------------------------
+    # Dynamic content injection ([LAST_BROWSER_OUTPUT])
+    # ------------------------------------------------------------------
+
+    def test_toolbox_tracks_last_browser_result_on_success(self):
+        self.assertIsNone(self.toolbox.last_browser_result)
+        self._mock_get("<html><body><h1>Tracked</h1><p>payload text</p></body></html>")
+        res = self.toolbox.web_browser_tool("https://example.com/feed")
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertIn("Tracked", self.toolbox.last_browser_result)
+        self.assertIn("payload text", self.toolbox.last_browser_result)
+
+    def _mock_get(self, body: str):
+        from unittest.mock import MagicMock, patch as _patch
+        patcher = _patch("urllib.request.urlopen")
+        mock_urlopen = patcher.start()
+        self.addCleanup(patcher.stop)
+        resp = MagicMock()
+        resp.status = 200
+        resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+        resp.read.return_value = body.encode("utf-8")
+        resp.__enter__.return_value = resp
+        mock_urlopen.return_value = resp
+        return mock_urlopen
+
+    def test_file_writer_substitutes_placeholder(self):
+        self.toolbox.last_browser_result = "FETCHED PAYLOAD TEXT"
+        res = self.toolbox.file_writer_tool("out.txt", "[LAST_BROWSER_OUTPUT]")
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertTrue(res["injected_last_browser_output"])
+        written = open(os.path.join(self.test_dir, "out.txt"), encoding="utf-8").read()
+        self.assertEqual(written, "FETCHED PAYLOAD TEXT")
+
+    def test_file_writer_replaces_every_placeholder_occurrence(self):
+        self.toolbox.last_browser_result = "X"
+        res = self.toolbox.file_writer_tool("multi.txt", "a[LAST_BROWSER_OUTPUT]b[LAST_BROWSER_OUTPUT]c")
+        self.assertEqual(res["status"], "SUCCESS")
+        written = open(os.path.join(self.test_dir, "multi.txt"), encoding="utf-8").read()
+        self.assertEqual(written, "aXbXc")
+
+    def test_file_writer_ignores_placeholder_lookalikes(self):
+        # Only the EXACT token is intercepted. Lowercase and half-open spellings contain
+        # no complete "[LAST_BROWSER_OUTPUT]" and must be written to disk verbatim.
+        self.toolbox.last_browser_result = "payload"
+        literal = "[last_browser_output] [LAST_BROWSER_OUTPUT [LAST_BROWSER_OUTPUT"
+        res = self.toolbox.file_writer_tool("literal.txt", literal)
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertFalse(res["injected_last_browser_output"])
+        written = open(os.path.join(self.test_dir, "literal.txt"), encoding="utf-8").read()
+        self.assertEqual(written, literal)
+
+    def test_file_writer_replaces_exact_token_among_lookalikes(self):
+        # A genuine exact token is substituted even when surrounded by near-misses,
+        # while every lookalike survives untouched.
+        self.toolbox.last_browser_result = "payload"
+        res = self.toolbox.file_writer_tool(
+            "mixed.txt", "[last_browser_output]|[LAST_BROWSER_OUTPUT]|[LAST_BROWSER_OUTPUT"
+        )
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertTrue(res["injected_last_browser_output"])
+        written = open(os.path.join(self.test_dir, "mixed.txt"), encoding="utf-8").read()
+        self.assertEqual(written, "[last_browser_output]|payload|[LAST_BROWSER_OUTPUT")
+
+    def test_file_writer_errors_when_no_browser_result_available(self):
+        self.toolbox.reset_browser_result()
+        res = self.toolbox.file_writer_tool("never.txt", "[LAST_BROWSER_OUTPUT]")
+        self.assertEqual(res["status"], "ERROR")
+        self.assertIn("web_browser_tool", res["error"])
+        self.assertFalse(os.path.exists(os.path.join(self.test_dir, "never.txt")))
+
+    def test_reset_browser_result_clears_tracker(self):
+        self.toolbox.last_browser_result = "something"
+        self.toolbox.reset_browser_result()
+        self.assertIsNone(self.toolbox.last_browser_result)
+
+    def test_plain_content_is_untouched_by_injection(self):
+        self.toolbox.last_browser_result = "should not appear"
+        res = self.toolbox.file_writer_tool("plain.txt", "ordinary content")
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertFalse(res["injected_last_browser_output"])
+        written = open(os.path.join(self.test_dir, "plain.txt"), encoding="utf-8").read()
+        self.assertEqual(written, "ordinary content")
 
 
 
