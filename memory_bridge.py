@@ -32,30 +32,69 @@ class ShortTermState:
     active_plan: List[str] = field(default_factory=list)
     context_data: Dict[str, Any] = field(default_factory=dict)
     session_cookies: Dict[str, str] = field(default_factory=dict)
+    proposals_ledger: List[Dict[str, Any]] = field(default_factory=list)
     last_updated: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
+        """
+        Serializes to a plain JSON-compatible dictionary.
+
+        `proposals_ledger` and `session_cookies` are always emitted (never omitted when
+        empty) so downstream readers and cloud state migrations can rely on the keys
+        being structurally present regardless of how this instance was constructed.
+        """
         return {
             "run_id": self.run_id,
             "current_state": self.current_state,
             "cycle_count": self.cycle_count,
-            "active_plan": self.active_plan,
-            "context_data": self.context_data,
-            "session_cookies": self.session_cookies,
+            "active_plan": self.active_plan if isinstance(self.active_plan, list) else [],
+            "context_data": self.context_data if isinstance(self.context_data, dict) else {},
+            "session_cookies": self.session_cookies if isinstance(self.session_cookies, dict) else {},
+            "proposals_ledger": self._normalize_ledger(self.proposals_ledger),
             "last_updated": self.last_updated,
         }
 
+    @staticmethod
+    def _normalize_ledger(raw_ledger: Any) -> List[Dict[str, Any]]:
+        """
+        Coerces any incoming ledger payload into a clean list of dictionaries.
+        Non-list payloads degrade to [] and non-dict entries are dropped, so a
+        malformed or partially-migrated state file can never propagate bad types.
+        """
+        if not isinstance(raw_ledger, list):
+            return []
+        return [dict(entry) for entry in raw_ledger if isinstance(entry, dict)]
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> ShortTermState:
+        """
+        Hydrates an instance from a dictionary, tolerating missing keys and partially
+        migrated legacy payloads. Every structural attribute is read defensively and
+        falls back to a safe default rather than raising.
+        """
+        if not isinstance(data, dict):
+            data = {}
+
         raw_cookies = data.get("session_cookies", {})
         cookies = {str(k): str(v) for k, v in raw_cookies.items()} if isinstance(raw_cookies, dict) else {}
+
+        # Prefer the top-level ledger; fall back to a ledger mirrored inside context_data.
+        raw_context = data.get("context_data", {})
+        context_data = dict(raw_context) if isinstance(raw_context, dict) else {}
+        raw_ledger = data.get("proposals_ledger", None)
+        if raw_ledger is None:
+            raw_ledger = context_data.get("proposals_ledger", [])
+
+        raw_plan = data.get("active_plan", [])
+
         return cls(
             run_id=data.get("run_id", "default_run"),
             current_state=data.get("current_state", "WAKE_UP"),
-            cycle_count=data.get("cycle_count", 0),
-            active_plan=data.get("active_plan", []),
-            context_data=data.get("context_data", {}),
+            cycle_count=data.get("cycle_count", 0) or 0,
+            active_plan=list(raw_plan) if isinstance(raw_plan, list) else [],
+            context_data=context_data,
             session_cookies=cookies,
+            proposals_ledger=cls._normalize_ledger(raw_ledger),
             last_updated=data.get("last_updated", datetime.now(timezone.utc).isoformat()),
         )
 

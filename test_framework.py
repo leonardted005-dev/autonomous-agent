@@ -157,6 +157,92 @@ class TestMemoryBridge(unittest.TestCase):
         self.assertEqual(logs[0].entry_id, "log_001")
         self.assertEqual(logs[0].payload["action"], "buy_signal_scan")
 
+    # ------------------------------------------------------------------
+    # Structural attribute alignment (regression: proposals_ledger)
+    # ------------------------------------------------------------------
+
+    def test_short_term_state_declares_structural_attributes(self):
+        # The class must explicitly declare these fields with empty-container defaults,
+        # otherwise `object.proposals_ledger` raises AttributeError during hydration.
+        import dataclasses
+
+        names = [f.name for f in dataclasses.fields(ShortTermState)]
+        self.assertIn("proposals_ledger", names)
+        self.assertIn("session_cookies", names)
+
+        struct = ShortTermState(run_id="r", current_state=AgentState.WAKE_UP.value)
+        self.assertEqual(struct.proposals_ledger, [])
+        self.assertEqual(struct.session_cookies, {})
+        # Empty containers must never be shared between instances (mutable-default trap).
+        other = ShortTermState(run_id="r2", current_state=AgentState.SLEEP.value)
+        struct.proposals_ledger.append({"task_id": "x"})
+        self.assertEqual(other.proposals_ledger, [])
+
+    def test_to_dict_always_emits_ledger_and_cookies(self):
+        state = ShortTermState(run_id="r", current_state="SLEEP")
+        payload = state.to_dict()
+        # Keys are structurally present even when empty, so cloud migrations can rely on them.
+        self.assertEqual(payload["proposals_ledger"], [])
+        self.assertEqual(payload["session_cookies"], {})
+
+        # Malformed payloads degrade to [] rather than propagating bad types.
+        state.proposals_ledger = "not-a-list"  # type: ignore[assignment]
+        state.session_cookies = None  # type: ignore[assignment]
+        payload = state.to_dict()
+        self.assertEqual(payload["proposals_ledger"], [])
+        self.assertEqual(payload["session_cookies"], {})
+
+    def test_from_dict_tolerates_missing_and_legacy_keys(self):
+        # A pre-patch state file: no proposals_ledger, no session_cookies at all.
+        legacy = {"run_id": "old", "current_state": "SLEEP", "cycle_count": 3}
+        state = ShortTermState.from_dict(legacy)
+        self.assertEqual(state.proposals_ledger, [])
+        self.assertEqual(state.session_cookies, {})
+        self.assertEqual(state.run_id, "old")
+
+        # Non-dict / garbage payloads must not raise.
+        self.assertEqual(ShortTermState.from_dict(None).proposals_ledger, [])  # type: ignore[arg-type]
+        self.assertEqual(ShortTermState.from_dict([]).proposals_ledger, [])  # type: ignore[arg-type]
+        self.assertEqual(ShortTermState.from_dict({"proposals_ledger": "nope"}).proposals_ledger, [])
+        self.assertEqual(
+            ShortTermState.from_dict({"proposals_ledger": ["bad", {"task_id": "ok"}]}).proposals_ledger,
+            [{"task_id": "ok"}],
+        )
+
+    def test_from_dict_reads_ledger_mirrored_inside_context_data(self):
+        # Dashboard builds that mirror the ledger under context_data still hydrate it.
+        payload = {
+            "run_id": "r",
+            "current_state": "SLEEP",
+            "context_data": {"proposals_ledger": [{"task_id": "mirrored", "status": "PENDING_APPROVAL"}]},
+        }
+        state = ShortTermState.from_dict(payload)
+        self.assertEqual(len(state.proposals_ledger), 1)
+        self.assertEqual(state.proposals_ledger[0]["task_id"], "mirrored")
+
+    def test_legacy_state_file_round_trips_through_bridge(self):
+        # End-to-end: a legacy JSON blob (written before the ledger existed) must load
+        # without AttributeError and gain the new structural fields.
+        from datetime import datetime, timezone
+        legacy_dict = {
+            "run_id": "legacy_run",
+            "current_state": "PLAN",
+            "cycle_count": 2,
+            "active_plan": ["1. inspect"],
+            "context_data": {},
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+        }
+        path = self.bridge._state_file_path("legacy_agent")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(legacy_dict, f)
+
+        loaded = self.bridge.load_short_term_state("legacy_agent")
+        self.assertIsNotNone(loaded)
+        # The historical AttributeError site: this attribute access must succeed.
+        self.assertEqual(loaded.proposals_ledger, [])
+        self.assertEqual(loaded.session_cookies, {})
+        self.assertIn("proposals_ledger", loaded.to_dict())
+
 
 class TestAutonomousAgentCore(unittest.TestCase):
     def setUp(self):
@@ -306,6 +392,79 @@ class TestHumanInTheLoop(unittest.TestCase):
         fsm4.transition_to(AgentState.SLEEP, reason="wind down")
         with self.assertRaises(StateTransitionError):
             fsm4.transition_to(AgentState.EXECUTE, reason="illegal post-sleep leap")
+
+    def test_initialize_state_survives_state_missing_new_attributes(self):
+        # Regression for: AttributeError: 'ShortTermState' object has no attribute
+        # 'proposals_ledger'. A state object from a pre-patch revision (or a stale
+        # module import that built a partially-populated dataclass) must hydrate safely.
+        import dataclasses
+
+        @dataclasses.dataclass
+        class LegacyShortTermState:
+            run_id: str
+            current_state: str
+            cycle_count: int = 0
+            active_plan: object = dataclasses.field(default_factory=list)
+            context_data: object = dataclasses.field(default_factory=dict)
+            last_updated: str = "x"
+            # Deliberately NO proposals_ledger and NO session_cookies.
+
+        legacy = LegacyShortTermState(
+            run_id="legacy",
+            current_state=AgentState.SLEEP.value,
+            cycle_count=9,
+            active_plan=["1. inspect"],
+            context_data={
+                "pending_proposal": {
+                    "task_id": "old77",
+                    "type": "Trend Report",
+                    "target_platform": "Medium",
+                    "proposed_action": "publish report",
+                    "status": "PENDING_APPROVAL",
+                    "human_decision": None,
+                }
+            },
+        )
+        # Force the loader to hand back an object lacking the new attributes.
+        self.bridge.load_short_term_state = lambda agent_id: legacy
+
+        agent = AutonomousAgent(config=AgentConfig(agent_id="legacy_load"), memory_bridge=self.bridge)
+        agent.initialize_state()  # must not raise AttributeError
+
+        self.assertEqual(agent.session_cookies, {})
+        self.assertEqual(agent.state_manager.context.cycle_count, 10)
+        # The legacy gated task still migrates into the ledger.
+        self.assertEqual(len(agent.state_manager.proposals_ledger), 1)
+        self.assertEqual(agent.state_manager.proposals_ledger[0]["task_id"], "old77")
+
+    def test_initialize_state_survives_structurally_broken_state(self):
+        # Even hostile payloads (non-dict context, bad types) must not break the loader.
+        import dataclasses
+
+        @dataclasses.dataclass
+        class BrokenState:
+            run_id: str = "broken"
+            current_state: str = "SLEEP"
+            cycle_count: object = None
+            active_plan: object = "not-a-list"
+            context_data: object = "not-a-dict"
+            proposals_ledger: object = "not-a-list"
+            session_cookies: object = "not-a-dict"
+
+        self.bridge.load_short_term_state = lambda agent_id: BrokenState()
+        agent = AutonomousAgent(config=AgentConfig(agent_id="broken_load"), memory_bridge=self.bridge)
+        agent.initialize_state()  # must not raise
+
+        self.assertEqual(agent.session_cookies, {})
+        self.assertEqual(agent.state_manager.proposals_ledger, [])
+        self.assertEqual(agent.state_manager.context.active_plan, [])
+
+    def test_state_to_dict_helper_handles_plain_dicts_and_objects(self):
+        self.assertEqual(AutonomousAgent._state_to_dict({"a": 1}), {"a": 1})
+        state = ShortTermState(run_id="r", current_state="SLEEP", cycle_count=4)
+        self.assertEqual(AutonomousAgent._state_to_dict(state)["cycle_count"], 4)
+        # An object with no to_dict/vars still degrades to an empty dict, never raises.
+        self.assertEqual(AutonomousAgent._state_to_dict(object()), {})
 
     def _seed_ledger(self, ledger, active_plan=None, current_state=AgentState.SLEEP.value):
         """Persists a pre-built proposals_ledger as the previous run's state."""
