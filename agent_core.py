@@ -396,19 +396,25 @@ class LLMClient:
 
     Production-grade multi-provider failover chain (Fallback Priority Ledger):
       Priority 1: Groq       (GROQ_API_KEY,       api.groq.com, qwen/qwen3.8-27b)
-      Priority 2: Gemini     (GEMINI_API_KEY,     googleapis.com, gemini-1.5-flash)
-      Priority 3: Mistral    (MISTRAL_API_KEY,    mistral.ai, mistral-small-latest)
-      Priority 4: OpenRouter (OPENROUTER_API_KEY, openrouter.ai, openrouter/free)
-      Priority 5: xKiro      (XKIRO_API_KEY,      api.xkiro.com, open-weights fallback)
+      Priority 2: xKiro      (XKIRO_API_KEY,      api.xkiro.com, qwen/qwen3-32b)
+      Priority 3: Gemini     (GEMINI_API_KEY,     generativelanguage.googleapis.com, gemini-1.5-flash)
+      Priority 4: Mistral    (MISTRAL_API_KEY,    mistral.ai, mistral-small-latest)
+      Priority 5: OpenRouter (OPENROUTER_API_KEY, openrouter.ai, openrouter/free)
     """
 
     # Fallback Priority Ledger: ordered provider chain for rate-limit resilience.
-    FALLBACK_PRIORITY_LEDGER: List[Dict[str, str]] = [
-        {"name": "groq", "api_base": "https://api.groq.com/openai/v1", "model": "qwen/qwen3.8-27b", "key_env": "GROQ_API_KEY"},
-        {"name": "gemini", "api_base": "https://generativelanguage.googleapis.com/v1beta/openai", "model": "gemini-1.5-flash", "key_env": "GEMINI_API_KEY"},
-        {"name": "mistral", "api_base": "https://api.mistral.ai/v1", "model": "mistral-small-latest", "key_env": "MISTRAL_API_KEY"},
-        {"name": "openrouter", "api_base": "https://openrouter.ai/api/v1", "model": "openrouter/free", "key_env": "OPENROUTER_API_KEY"},
-        {"name": "xkiro", "api_base": "https://api.xkiro.com/v1", "model": "qwen/qwen3-32b", "key_env": "XKIRO_API_KEY"},
+    #
+    # `max_tokens` is applied to every tier that declares it. Groq and the other
+    # short-text free tiers pre-emptively reject oversized expected output windows
+    # with HTTP 429, so they are capped at MAX_OUTPUT_TOKENS to keep requests cheap.
+    MAX_OUTPUT_TOKENS: int = 500
+
+    FALLBACK_PRIORITY_LEDGER: List[Dict[str, Any]] = [
+        {"name": "groq", "api_base": "https://api.groq.com/openai/v1", "model": "qwen/qwen3.8-27b", "key_env": "GROQ_API_KEY", "max_tokens": MAX_OUTPUT_TOKENS},
+        {"name": "xkiro", "api_base": "https://api.xkiro.com/v1", "model": "qwen/qwen3-32b", "key_env": "XKIRO_API_KEY", "max_tokens": MAX_OUTPUT_TOKENS},
+        {"name": "gemini", "api_base": "https://generativelanguage.googleapis.com/v1beta/openai", "model": "gemini-1.5-flash", "key_env": "GEMINI_API_KEY", "max_tokens": MAX_OUTPUT_TOKENS},
+        {"name": "mistral", "api_base": "https://api.mistral.ai/v1", "model": "mistral-small-latest", "key_env": "MISTRAL_API_KEY", "max_tokens": MAX_OUTPUT_TOKENS},
+        {"name": "openrouter", "api_base": "https://openrouter.ai/api/v1", "model": "openrouter/free", "key_env": "OPENROUTER_API_KEY", "max_tokens": MAX_OUTPUT_TOKENS},
     ]
 
     # HTTP statuses that trigger failover to the next priority provider.
@@ -441,12 +447,12 @@ class LLMClient:
         for entry in self.FALLBACK_PRIORITY_LEDGER:
             if entry["name"] == preferred and os.getenv(entry["key_env"]):
                 key = str(os.getenv(entry["key_env"])).strip()
-                chain.append({"name": entry["name"], "api_base": entry["api_base"], "model": entry["model"], "key": key, "key_env": entry["key_env"]})
+                chain.append({"name": entry["name"], "api_base": entry["api_base"], "model": entry["model"], "key": key, "key_env": entry["key_env"], "max_tokens": entry.get("max_tokens")})
                 seen.add(entry["name"])
                 break
 
         if preferred in ("openai", "anthropic") and self.api_key:
-            chain.append({"name": preferred, "api_base": self.config.llm_api_base, "model": self.config.llm_model, "key": str(self.api_key).strip(), "key_env": "OPENAI_API_KEY"})
+            chain.append({"name": preferred, "api_base": self.config.llm_api_base, "model": self.config.llm_model, "key": str(self.api_key).strip(), "key_env": "OPENAI_API_KEY", "max_tokens": None})
             seen.add(preferred)
 
         for entry in self.FALLBACK_PRIORITY_LEDGER:
@@ -456,17 +462,33 @@ class LLMClient:
             if not key:
                 continue
             model = os.getenv(entry["name"].upper() + "_MODEL", entry["model"])
-            chain.append({"name": entry["name"], "api_base": entry["api_base"], "model": model, "key": str(key).strip(), "key_env": entry["key_env"]})
+            chain.append({"name": entry["name"], "api_base": entry["api_base"], "model": model, "key": str(key).strip(), "key_env": entry["key_env"], "max_tokens": entry.get("max_tokens")})
 
         if not chain and self.api_key:
-            chain.append({"name": preferred, "api_base": self.config.llm_api_base, "model": self.config.llm_model, "key": str(self.api_key).strip(), "key_env": "LLM_API_KEY"})
+            chain.append({"name": preferred, "api_base": self.config.llm_api_base, "model": self.config.llm_model, "key": str(self.api_key).strip(), "key_env": "LLM_API_KEY", "max_tokens": None})
 
         return chain
 
-    def _post_chat_completion(self, api_base: str, model: str, api_key: str, messages: List[Dict[str, str]], temperature: float) -> str:
-        """Executes a single OpenAI-compatible chat completion POST request."""
+    def _post_chat_completion(
+        self,
+        api_base: str,
+        model: str,
+        api_key: str,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """
+        Executes a single OpenAI-compatible chat completion POST request.
+
+        `max_tokens` is applied only when the tier declares it. Free short-text tiers
+        (Groq, xKiro, Gemini, Mistral, OpenRouter) cap the output window so the provider
+        does not pre-emptively reject the request with HTTP 429 on oversized OTPM math.
+        """
         endpoint = f"{api_base.rstrip('/')}/chat/completions"
-        payload = {"model": model, "messages": messages, "temperature": temperature}
+        payload: Dict[str, Any] = {"model": model, "messages": messages, "temperature": temperature}
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            payload["max_tokens"] = max_tokens
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key.strip()}",
@@ -498,7 +520,14 @@ class LLMClient:
             label = provider["name"] + " (" + provider["model"] + " @ " + provider["api_base"] + ")"
             try:
                 logger.info("LLM attempt %d/%d via %s", index + 1, len(chain), label)
-                return self._post_chat_completion(provider["api_base"], provider["model"], provider["key"], messages, temperature)
+                return self._post_chat_completion(
+                    provider["api_base"],
+                    provider["model"],
+                    provider["key"],
+                    messages,
+                    temperature,
+                    max_tokens=provider.get("max_tokens"),
+                )
             except urllib.error.HTTPError as http_err:
                 error_body = http_err.read().decode("utf-8", errors="replace")
                 logger.error("LLM HTTP error %d via %s: %s", http_err.code, label, error_body)
@@ -890,7 +919,12 @@ class AutonomousAgent:
         return {str(k): f"<redacted:{len(str(v))}ch>" for k, v in session.items()} if isinstance(session, dict) else {}
 
     def generate_monologue(self, prompt: str) -> str:
-        """Enforces an internal structured monologue and autonomous reasoning from the AI brain."""
+        """
+        Enforces an internal structured monologue and autonomous reasoning from the AI brain.
+
+        Always returns a string: a degraded/None provider response is coerced to "" by
+        `_safe_monologue` at the call sites in `run_cycle`.
+        """
         system_prompt = (
             "You are a fully self-improving autonomous entity. Your objective is to identify digital arbitrage, freelance development tasks, "
             "or automated micro-business opportunities. Browse public boards and tech updates to identify gaps and other ways you can "
@@ -1488,6 +1522,36 @@ class AutonomousAgent:
         )
         return stored
 
+    @staticmethod
+    def _safe_monologue(monologue: Any) -> str:
+        """
+        Defensive guard on the LLM monologue response.
+
+        A provider can return None, an empty string, or a non-string payload (a dict
+        when a gateway ignores `response_format`, a truncated body, etc.). Calling
+        `.splitlines()` on any of those would crash the cycle, so the value is coerced
+        to a safe empty string and the degradation is reported on stdout.
+        """
+        if monologue is None or not isinstance(monologue, str):
+            print(
+                "[WARNING] Received empty or invalid LLM response. "
+                "Initializing safety empty monologue string to prevent splitlines crash."
+            )
+            logger.warning(
+                "Invalid monologue type received (%s); substituting empty string.",
+                type(monologue).__name__,
+            )
+            return ""
+        return monologue
+
+    def _parse_plan_steps(self, monologue: Any) -> List[str]:
+        """Extracts numbered plan lines from a monologue, safely handling bad payloads."""
+        safe = self._safe_monologue(monologue)
+        return [
+            line.strip() for line in safe.splitlines()
+            if re.match(r"^\d+\.\s", line.strip())
+        ]
+
     def run_cycle(self) -> None:
         """
         Executes one full lifecycle iteration: WAKE_UP -> PLAN -> EXECUTE -> EVALUATE -> SLEEP.
@@ -1555,12 +1619,9 @@ class AutonomousAgent:
                     "opportunities and formulate the next atomic operational plan "
                     "(up to 5 chained TOOL_CALL steps)."
                 )
-                monologue = self.generate_monologue(plan_prompt)
+                monologue = self._safe_monologue(self.generate_monologue(plan_prompt))
                 logger.info("Internal Monologue Generated (post-approval):\n%s", monologue)
-                ctx.active_plan = [
-                    line.strip() for line in monologue.splitlines()
-                    if re.match(r"^\d+\.\s", line.strip())
-                ]
+                ctx.active_plan = self._parse_plan_steps(monologue)
                 if self._requires_human_approval(monologue):
                     self._register_gate(monologue, "PLAN")
                     # Non-blocking: fall through and keep executing the rest of the plan.
@@ -1581,12 +1642,9 @@ class AutonomousAgent:
                     "Task: Synthesize context and formulate an atomic operational plan "
                     "(up to 5 chained TOOL_CALL steps)."
                 )
-                monologue = self.generate_monologue(plan_prompt)
+                monologue = self._safe_monologue(self.generate_monologue(plan_prompt))
                 logger.info("Internal Monologue Generated:\n%s", monologue)
-                ctx.active_plan = [
-                    line.strip() for line in monologue.splitlines()
-                    if re.match(r"^\d+\.\s", line.strip())
-                ]
+                ctx.active_plan = self._parse_plan_steps(monologue)
 
                 # PLAN-phase Human-in-the-Loop detection.
                 # NON-BLOCKING: the task is appended to the ledger and the run continues.
@@ -1679,7 +1737,7 @@ class AutonomousAgent:
                 f"Proposals Ledger Status: {json.dumps(self.state_manager.ledger_summary())}\n"
                 "Task: Evaluate if milestones succeeded and confirm safe completion."
             )
-            eval_monologue = self.generate_monologue(eval_prompt)
+            eval_monologue = self._safe_monologue(self.generate_monologue(eval_prompt))
             logger.info("Evaluation Monologue:\n%s", eval_monologue)
 
             # --- 4. EVALUATE -> SLEEP (whole multi-step plan concluded) ---
