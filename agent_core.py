@@ -121,12 +121,28 @@ class Toolbox:
     Zero-dependency autonomous capabilities engine.
     Equips the agent with standard library tools for environment perception,
     local asset authoring, and external communication.
+
+    Supports dynamic content injection: the clean text payload of the most recent
+    successful `web_browser_tool` call is tracked in `last_browser_result`, and the
+    placeholder token `[LAST_BROWSER_OUTPUT]` inside a `file_writer_tool` `content`
+    argument is substituted with it - letting the model pipe a web result straight
+    into a workspace file within the same run loop.
     """
+
+    # Exact placeholder token the agent must emit to pull in the last browser payload.
+    LAST_BROWSER_OUTPUT_TOKEN = "[LAST_BROWSER_OUTPUT]"
 
     def __init__(self, workspace_root: Optional[str] = None, request_timeout: int = 15) -> None:
         self.workspace_root = Path(workspace_root or os.getcwd()).resolve()
         self.request_timeout = request_timeout
+        # Temporary memory tracker: clean text payload of the most recent successful
+        # web_browser_tool call (None until a successful read happens this session).
+        self.last_browser_result: Optional[str] = None
         logger.info("Toolbox initialized with workspace root: %s", self.workspace_root)
+
+    def reset_browser_result(self) -> None:
+        """Clears the tracked browser payload (used at the start of each cycle)."""
+        self.last_browser_result = None
 
     @staticmethod
     def _format_cookie_header(session_cookies: Optional[Dict[str, str]]) -> str:
@@ -212,6 +228,13 @@ class Toolbox:
                 normalized = " ".join(unescaped.split())
                 preview = normalized[:4000]
 
+                # Track the clean text payload so a later file_writer_tool in this same
+                # run loop can inject it via the [LAST_BROWSER_OUTPUT] placeholder.
+                self.last_browser_result = normalized
+                logger.info(
+                    "Tracked last_browser_result for content injection (%d char(s)).", len(normalized)
+                )
+
                 return {
                     "status": "SUCCESS",
                     "url": url,
@@ -232,10 +255,35 @@ class Toolbox:
         """
         Safely writes out scripts, reports, or data files into the workspace directory.
         Enforces path containment within the workspace root.
+
+        Dynamic content injection: if `content` contains the exact placeholder token
+        `[LAST_BROWSER_OUTPUT]`, it is replaced with the clean text payload captured by
+        the most recent successful `web_browser_tool` call before writing.
         """
         logger.info("Toolbox: file_writer_tool called for filepath: %s", filepath)
         if not filepath or not isinstance(filepath, str):
             return {"status": "ERROR", "error": "Invalid filepath provided."}
+
+        injected = False
+        if not isinstance(content, str):
+            content = "" if content is None else str(content)
+
+        if self.LAST_BROWSER_OUTPUT_TOKEN in content:
+            payload = self.last_browser_result
+            if payload is None:
+                err = (
+                    f"Placeholder '{self.LAST_BROWSER_OUTPUT_TOKEN}' was requested but no successful "
+                    "web_browser_tool result is available in this run. Call web_browser_tool first."
+                )
+                logger.warning("file_writer_tool injection skipped: %s", err)
+                return {"status": "ERROR", "filepath": filepath, "error": err}
+
+            content = content.replace(self.LAST_BROWSER_OUTPUT_TOKEN, payload)
+            injected = True
+            logger.info(
+                "Injected last_browser_result (%d char(s)) into '%s' via %s placeholder.",
+                len(payload), filepath, self.LAST_BROWSER_OUTPUT_TOKEN,
+            )
 
         try:
             target_path = (self.workspace_root / filepath).resolve()
@@ -253,6 +301,7 @@ class Toolbox:
                 "status": "SUCCESS",
                 "filepath": str(target_path.relative_to(self.workspace_root)),
                 "bytes_written": len(content),
+                "injected_last_browser_output": injected,
             }
         except Exception as e:
             msg = f"Failed to write file '{filepath}': {str(e)}"
@@ -314,7 +363,13 @@ class Toolbox:
             return {"status": "ERROR", "url": url, "error": msg}
 
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Dispatches dynamic tool execution by name with arguments."""
+        """
+        Dispatches dynamic tool execution by name with arguments.
+
+        The [LAST_BROWSER_OUTPUT] placeholder is substituted inside file_writer_tool,
+        so a web read and the file write that consumes it can run as adjacent links of
+        the same tool chain without the model ever re-typing the payload.
+        """
         if tool_name == "web_browser_tool":
             return self.web_browser_tool(url=arguments.get("url", ""), session_cookies=arguments.get("session_cookies"))
         elif tool_name == "file_writer_tool":
@@ -786,6 +841,9 @@ class AutonomousAgent:
         }
         # Working memory is per-run (chained tool outputs observed this cycle only).
         self._working_memory = []
+        # The injected-browser-output tracker is per-run too: clearing it stops a stale
+        # payload from a previous cycle being written into this cycle's files.
+        self.toolbox.reset_browser_result()
 
     def persist_current_state(self) -> None:
         """Saves current ephemeral context into memory bridge for the next stateless run."""
@@ -863,6 +921,13 @@ class AutonomousAgent:
             "so you reuse your authenticated session automatically.\n"
             "2. file_writer_tool(filepath: str, content: str): Writes scripts, portfolios, reports, or data files in local workspace.\n"
             "3. http_poster_tool(url: str, payload: dict, headers: dict = None): Sends POST requests to simulate platform actions or submit data.\n\n"
+            "DYNAMIC CONTENT INJECTION (CRITICAL): When you want to save the raw JSON or text results retrieved from a "
+            "web browser tool call directly into a workspace file within the same cycle run, you MUST set the `content` "
+            "argument of your `file_writer_tool` step to exactly: '[LAST_BROWSER_OUTPUT]'. Never retype, summarise, or "
+            "truncate a fetched payload yourself - the placeholder is substituted with the full clean text of the most "
+            "recent successful web_browser_tool call.\n"
+            'Example: TOOL_CALL: web_browser_tool {"url": "https://news.example/feed"}\n'
+            'Example: TOOL_CALL: file_writer_tool {"filepath": "feed_snapshot.txt", "content": "[LAST_BROWSER_OUTPUT]"}\n\n'
             "TOOL CALL FORMAT (CHAIN UP TO 5 SEQUENTIALLY):\n"
             "To invoke tools in your plan, write numbered TOOL_CALL lines in execution order. Each line runs as one "
             "chain link; the output of link N is appended to working memory and visible before link N+1 executes.\n"
