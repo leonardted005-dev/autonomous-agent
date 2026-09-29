@@ -649,6 +649,37 @@ class AutonomousAgent:
         self.session_cookies: Dict[str, str] = {}
         self._working_memory: List[str] = []
 
+    @staticmethod
+    def _state_to_dict(state: Any) -> Dict[str, Any]:
+        """
+        Safely normalizes a persisted state object into a plain dictionary.
+
+        Migration safety net: if a state class comes from an older revision of the
+        memory bridge (or a stale module import) that pre-dates a newer structural
+        attribute, its own `to_dict()` output simply lacks that key. Reading through
+        this dictionary first - and falling back to `vars()`/`__dict__` - lets the
+        loader tolerate any attribute mismatch instead of raising AttributeError.
+        """
+        if isinstance(state, dict):
+            return dict(state)
+
+        for method_name in ("to_dict", "model_dump", "as_dict"):
+            method = getattr(state, method_name, None)
+            if callable(method):
+                try:
+                    result = method()
+                except Exception as exc:  # never let a serialization bug break hydration
+                    logger.warning("State %s() failed during hydration: %s", method_name, exc)
+                    continue
+                if isinstance(result, dict):
+                    return dict(result)
+
+        try:
+            return dict(vars(state))
+        except Exception:
+            logger.warning("Could not introspect persisted state of type %s.", type(state).__name__)
+            return {}
+
     def initialize_state(self) -> None:
         """Hydrates previous context from memory bridge or starts fresh WAKE_UP context."""
         logger.info("Agent wake up initialized for Agent ID: '%s'", self.config.agent_id)
@@ -657,19 +688,49 @@ class AutonomousAgent:
         self._human_decision = None
 
         if saved_state:
-            logger.info("Found existing state from previous run (cycle #%d)", saved_state.cycle_count)
-            self._resume_state = saved_state.current_state
-            self._human_decision = saved_state.context_data.get("human_decision")
+            logger.info("Found existing state from previous run (cycle #%s)", getattr(saved_state, "cycle_count", 0))
+            # Safe routing for every hydrated field. A state object rebuilt by an older or
+            # mismatched memory-bridge revision may predate newer structural attributes
+            # (e.g. `session_cookies` / `proposals_ledger`), and a stale module import can
+            # leave a partially-populated dataclass. Reading through `getattr` plus the
+            # dict representation means migration can never raise AttributeError here.
+            saved_dict = self._state_to_dict(saved_state)
+
+            self._resume_state = getattr(saved_state, "current_state", None)
+            context_payload = getattr(saved_state, "context_data", None)
+            if not isinstance(context_payload, dict):
+                fallback_payload = saved_dict.get("context_data")
+                context_payload = dict(fallback_payload) if isinstance(fallback_payload, dict) else {}
+            self._human_decision = context_payload.get("human_decision")
+
+            raw_cycle = getattr(saved_state, "cycle_count", None)
+            if raw_cycle is None:
+                raw_cycle = saved_dict.get("cycle_count")
+            try:
+                cycle_count = int(raw_cycle or 0)
+            except (TypeError, ValueError):
+                cycle_count = 0
+
+            raw_plan = getattr(saved_state, "active_plan", None)
+            if not isinstance(raw_plan, list):
+                fallback_plan = saved_dict.get("active_plan")
+                raw_plan = fallback_plan if isinstance(fallback_plan, list) else []
+
             context = AgentContext(
                 run_id=f"run_{int(datetime.now(timezone.utc).timestamp())}",
-                cycle_count=saved_state.cycle_count + 1,
+                cycle_count=cycle_count + 1,
                 current_state=AgentState.WAKE_UP,
-                active_plan=saved_state.active_plan,
-                payload=saved_state.context_data,
+                active_plan=list(raw_plan),
+                payload=context_payload,
             )
-            # Hydrate the persistent global ledger. Prefer the top-level array; fall back
-            # to a ledger mirrored inside context_data for older/newer dashboard shapes.
-            ledger = saved_state.proposals_ledger or context.payload.get("proposals_ledger") or []
+            # Hydrate the persistent global ledger. Prefer the top-level array; fall back to
+            # a ledger mirrored inside context_data for older/newer dashboard shapes.
+            ledger = (
+                getattr(saved_state, "proposals_ledger", None)
+                or saved_dict.get("proposals_ledger")
+                or context.payload.get("proposals_ledger")
+                or []
+            )
             context.proposals_ledger = [
                 dict(entry) for entry in ledger if isinstance(entry, dict)
             ] if isinstance(ledger, list) else []
@@ -711,7 +772,18 @@ class AutonomousAgent:
             ),
         )
         # Hydrate the live session cookie map from persisted top-level state.
-        self.session_cookies: Dict[str, str] = dict(saved_state.session_cookies) if saved_state else {}
+        # Read through the same safe routing so a state object lacking this attribute
+        # (pre-patch revision) degrades to {} rather than raising AttributeError.
+        raw_cookies = (
+            getattr(saved_state, "session_cookies", None)
+            if saved_state else None
+        )
+        if not isinstance(raw_cookies, dict) and saved_state:
+            fallback = self._state_to_dict(saved_state).get("session_cookies")
+            raw_cookies = fallback if isinstance(fallback, dict) else {}
+        self.session_cookies: Dict[str, str] = {
+            str(k): str(v) for k, v in (raw_cookies or {}).items() if str(k).strip()
+        }
         # Working memory is per-run (chained tool outputs observed this cycle only).
         self._working_memory = []
 
