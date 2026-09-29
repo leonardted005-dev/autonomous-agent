@@ -31,7 +31,7 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
      - `web_browser_tool(url)`: Fetches and cleans textual content from public RSS feeds, job boards, or websites via `urllib.request`.
      - `file_writer_tool(filepath, content)`: Writes scripts, portfolios, reports, or application files into the local workspace with directory traversal containment.
      - `http_poster_tool(url, payload)`: Sends HTTP POST requests to simulate external platform interactions, registrations, or work submissions.
-   - Implements a production-grade 5-provider `LLMClient` Fallback Priority Ledger (Groq -> Gemini -> Mistral -> OpenRouter -> xKiro). On HTTP 429/400-class errors or timeouts it prints "[WARNING] Active provider failed with error. Diverting prompt state to the next priority engine backup..." and replays the exact prompt against the next engine.
+   - Implements a production-grade 5-provider `LLMClient` Fallback Priority Ledger: **Groq -> xKiro -> Gemini -> Mistral -> OpenRouter**. On HTTP 429/400-class errors or timeouts it prints "[WARNING] Active provider failed with error. Diverting prompt state to the next priority engine backup..." and replays the exact prompt against the next engine. Each free short-text tier sends a strict `max_tokens: 500` cap (`LLMClient.MAX_OUTPUT_TOKENS`) so providers do not pre-emptively reject requests with HTTP 429 on oversized expected output-window (OTPM) calculations; paid completions endpoints omit the field unless a cap is declared.
    - Instructs the agent with an open-ended discovery objective: analyze long-term memory, choose lucrative or educational digital tasks, execute tools dynamically, and log successes/failures for continuous self-improvement.
 
 ### Advanced Autonomy Features
@@ -76,9 +76,10 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
 | `CUSTOM_GIT_TOKEN` | `None` | Custom GitHub Personal Access Token (with `gist` scope) for Gist API authentication. Uses a custom name to avoid collision with Actions' internal `GITHUB_TOKEN` scope. |
 | `GIST_ID` | `None` | Private Gist ID used to persist state and logs across stateless cloud runs. |
 | `GROQ_API_KEY` | `None` | Priority 1 Groq key (model `qwen/qwen3.8-27b` @ `https://api.groq.com/openai/v1`). |
-| `GEMINI_API_KEY` | `None` | Priority 2 Gemini key (model `gemini-1.5-flash` @ `https://generativelanguage.googleapis.com/v1beta/openai`). |
-| `MISTRAL_API_KEY` | `None` | Priority 3 Mistral key (model `mistral-small-latest` @ `https://api.mistral.ai/v1`). |
-| `OPENROUTER_API_KEY` | `None` | Priority 4 OpenRouter key (model `openrouter/free` @ `https://openrouter.ai/api/v1`). |
+| `XKIRO_API_KEY` | `None` | Priority 2 xKiro key (model `qwen/qwen3-32b` @ `https://api.xkiro.com/v1`). |
+| `GEMINI_API_KEY` | `None` | Priority 3 Gemini key (model `gemini-1.5-flash` @ `https://generativelanguage.googleapis.com/v1beta/openai`). |
+| `MISTRAL_API_KEY` | `None` | Priority 4 Mistral key (model `mistral-small-latest` @ `https://api.mistral.ai/v1`). |
+| `OPENROUTER_API_KEY` | `None` | Priority 5 OpenRouter key (model `openrouter/free` @ `https://openrouter.ai/api/v1`). |
 | `XKIRO_API_KEY` | `None` | Priority 5 xKiro backup key (open-weights model `qwen/qwen3-32b` @ `https://api.xkiro.com/v1`). |
 | `DISCORD_WEBHOOK_URL` | `None` | Discord webhook that receives an embedded approval card when a proposal enters `PENDING_APPROVAL`. |
 | `SMTP_SERVER` / `SMTP_PORT` | `None` / `587` | SMTP endpoint for email alerts (STARTTLS; port 465 uses SSL). |
@@ -187,7 +188,7 @@ To enable cloud autonomy, configure your secrets in GitHub:
 | `GEMINI_API_KEY` | Your Google AI Studio key from [aistudio.google.com](https://aistudio.google.com) (Priority 2 backup). |
 | `MISTRAL_API_KEY` | Your Mistral key from [console.mistral.ai](https://console.mistral.ai) (Priority 3 backup). |
 | `OPENROUTER_API_KEY` | Your OpenRouter key from [openrouter.ai](https://openrouter.ai) (Priority 4 backup). |
-| `XKIRO_API_KEY` | Your xKiro key from [xkiro.com](https://xkiro.com) (Priority 5 backup, OpenAI-compatible `https://api.xkiro.com/v1`). |
+| `XKIRO_API_KEY` | Your xKiro key (Priority 2 failover provider, OpenAI-compatible `https://api.xkiro.com/v1`). |
 | `GIST_ID` | The 32-character ID of your private GitHub Gist created to store agent memory (e.g. from `https://gist.github.com/username/<GIST_ID>`). |
 | `GIT_TOKEN` (mapped to `CUSTOM_GIT_TOKEN`) | A GitHub Personal Access Token (classic with `gist` scope or fine-grained token with Gist read/write permission) so the runner can update the Gist. Stored as `GIT_TOKEN` secret, injected as `CUSTOM_GIT_TOKEN` env var to avoid collision with Actions' reserved `GITHUB_TOKEN`. |
 | `DISCORD_WEBHOOK_URL` (optional) | Discord channel webhook URL for instant approval cards (Channel Settings $\rightarrow$ Integrations $\rightarrow$ Webhooks). |

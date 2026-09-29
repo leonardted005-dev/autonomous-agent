@@ -272,17 +272,43 @@ class TestAutonomousAgentCore(unittest.TestCase):
 
 
 class TestLLMFailover(unittest.TestCase):
-    def test_ledger_registers_five_providers(self):
+    def test_ledger_registers_five_providers_in_priority_order(self):
         from agent_core import LLMClient
         ledger = LLMClient.FALLBACK_PRIORITY_LEDGER
         self.assertEqual(len(ledger), 5)
-        self.assertEqual([p["name"] for p in ledger], ["groq", "gemini", "mistral", "openrouter", "xkiro"])
+        # Groq -> xKiro -> Gemini -> Mistral -> OpenRouter
+        self.assertEqual(
+            [p["name"] for p in ledger],
+            ["groq", "xkiro", "gemini", "mistral", "openrouter"],
+        )
         self.assertEqual(ledger[0]["model"], "qwen/qwen3.8-27b")
-        self.assertEqual(ledger[1]["model"], "gemini-1.5-flash")
-        self.assertEqual(ledger[2]["model"], "mistral-small-latest")
-        self.assertEqual(ledger[3]["model"], "openrouter/free")
-        self.assertEqual(ledger[4]["key_env"], "XKIRO_API_KEY")
-        self.assertEqual(ledger[4]["api_base"], "https://api.xkiro.com/v1")
+        self.assertEqual(ledger[1]["model"], "qwen/qwen3-32b")
+        self.assertEqual(ledger[2]["model"], "gemini-1.5-flash")
+        self.assertEqual(ledger[3]["model"], "mistral-small-latest")
+        self.assertEqual(ledger[4]["model"], "openrouter/free")
+
+    def test_xkiro_is_priority_two_and_wired_to_its_gateway(self):
+        from agent_core import LLMClient
+        xkiro = LLMClient.FALLBACK_PRIORITY_LEDGER[1]
+        self.assertEqual(xkiro["name"], "xkiro")
+        self.assertEqual(xkiro["key_env"], "XKIRO_API_KEY")
+        self.assertEqual(xkiro["api_base"], "https://api.xkiro.com/v1")
+        self.assertTrue(xkiro["model"])
+        self.assertEqual(LLMClient.FALLBACK_PRIORITY_LEDGER[1]["max_tokens"], LLMClient.MAX_OUTPUT_TOKENS)
+
+    def test_xkiro_sits_between_groq_and_gemini_in_active_chain(self):
+        from unittest.mock import patch
+        with patch.dict(
+            os.environ,
+            {"GROQ_API_KEY": "g", "XKIRO_API_KEY": "x", "GEMINI_API_KEY": "m"},
+            clear=True,
+        ):
+            from agent_core import LLMClient
+            client = LLMClient(AgentConfig())
+            names = [p["name"] for p in client._resolve_provider_chain()]
+            self.assertEqual(names, ["groq", "xkiro", "gemini"])
+            self.assertLess(names.index("groq"), names.index("xkiro"))
+            self.assertLess(names.index("xkiro"), names.index("gemini"))
 
     def test_xkiro_included_when_key_present(self):
         from unittest.mock import patch
@@ -291,6 +317,94 @@ class TestLLMFailover(unittest.TestCase):
             chain = client._resolve_provider_chain()
             names = [p["name"] for p in chain]
             self.assertIn("xkiro", names)
+
+    def test_five_tier_chain_degrades_in_priority_order(self):
+        from unittest.mock import patch
+        env = {
+            "GROQ_API_KEY": "g",
+            "XKIRO_API_KEY": "x",
+            "GEMINI_API_KEY": "m",
+            "MISTRAL_API_KEY": "s",
+            "OPENROUTER_API_KEY": "o",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            client = LLMClient(AgentConfig())
+            chain = client._resolve_provider_chain()
+            self.assertEqual(
+                [p["name"] for p in chain],
+                ["groq", "xkiro", "gemini", "mistral", "openrouter"],
+            )
+            # Every tier resolves a distinct key and endpoint, so any one can fail over.
+            self.assertEqual(len({p["api_base"] for p in chain}), 5)
+            self.assertTrue(all(p["key"] for p in chain))
+
+    def test_failover_walks_from_groq_through_xkiro_to_gemini(self):
+        import io
+        import urllib.error
+        from unittest.mock import patch
+        env = {"GROQ_API_KEY": "g", "XKIRO_API_KEY": "x", "GEMINI_API_KEY": "m"}
+        with patch.dict(os.environ, env, clear=True):
+            client = LLMClient(AgentConfig())
+            calls = []
+
+            def fake_post(api_base, model, key, messages, temp, max_tokens=None):
+                calls.append((api_base, max_tokens))
+                if len(calls) < 3:
+                    raise urllib.error.HTTPError(
+                        "http://x", 429, "Too Many Requests", {}, io.BytesIO(b"rate limited")
+                    )
+                return "recovered via gemini"
+
+            with patch.object(client, "_post_chat_completion", side_effect=fake_post):
+                result = client.generate_completion([{"role": "user", "content": "hello"}])
+                self.assertEqual(result, "recovered via gemini")
+                self.assertEqual(len(calls), 3)
+                self.assertIn("groq", calls[0][0])
+                self.assertIn("xkiro", calls[1][0])
+                self.assertIn("googleapis", calls[2][0])
+                # The 500-token cap is applied on every free short-text tier.
+                self.assertTrue(all(cap == 500 for _, cap in calls))
+
+    def test_max_tokens_cap_applied_to_payload(self):
+        import json as _json
+        from unittest.mock import MagicMock, patch
+        with patch.dict(os.environ, {"GROQ_API_KEY": "g"}, clear=True):
+            client = LLMClient(AgentConfig())
+            with patch("urllib.request.urlopen") as mock_urlopen:
+                resp = MagicMock()
+                resp.status = 200
+                resp.read.return_value = _json.dumps(
+                    {"choices": [{"message": {"content": "ok"}}]}
+                ).encode("utf-8")
+                resp.__enter__.return_value = resp
+                mock_urlopen.return_value = resp
+
+                client._post_chat_completion(
+                    "https://api.groq.com/openai/v1", "qwen/qwen3.8-27b", "k",
+                    [{"role": "user", "content": "hi"}], 0.2, max_tokens=client.MAX_OUTPUT_TOKENS,
+                )
+                body = _json.loads(mock_urlopen.call_args[0][0].data.decode("utf-8"))
+                self.assertEqual(body["max_tokens"], 500)
+
+    def test_max_tokens_omitted_for_tiers_without_a_cap(self):
+        import json as _json
+        from unittest.mock import MagicMock, patch
+        client = LLMClient(AgentConfig())
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            resp = MagicMock()
+            resp.status = 200
+            resp.read.return_value = _json.dumps(
+                {"choices": [{"message": {"content": "ok"}}]}
+            ).encode("utf-8")
+            resp.__enter__.return_value = resp
+            mock_urlopen.return_value = resp
+
+            client._post_chat_completion(
+                "https://api.openai.com/v1", "gpt-4o-mini", "k",
+                [{"role": "user", "content": "hi"}], 0.2, max_tokens=None,
+            )
+            body = _json.loads(mock_urlopen.call_args[0][0].data.decode("utf-8"))
+            self.assertNotIn("max_tokens", body)
 
     def test_chain_skips_providers_without_keys(self):
         from unittest.mock import patch
@@ -305,22 +419,22 @@ class TestLLMFailover(unittest.TestCase):
         import io
         import urllib.error
         from unittest.mock import patch
-        with patch.dict(os.environ, {"GROQ_API_KEY": "gsk_a", "GEMINI_API_KEY": "gm_b"}, clear=False):
+        with patch.dict(os.environ, {"GROQ_API_KEY": "gsk_a", "XKIRO_API_KEY": "xk_b"}, clear=False):
             client = LLMClient(AgentConfig())
             calls = []
 
-            def fake_post(api_base, model, key, messages, temp):
+            def fake_post(api_base, model, key, messages, temp, max_tokens=None):
                 calls.append((api_base, model))
                 if len(calls) == 1:
                     raise urllib.error.HTTPError("http://x", 429, "Too Many Requests", {}, io.BytesIO(b"rate limited"))
-                return "recovered via gemini"
+                return "recovered via xkiro"
 
             with patch.object(client, "_post_chat_completion", side_effect=fake_post):
                 result = client.generate_completion([{"role": "user", "content": "hello"}])
-                self.assertEqual(result, "recovered via gemini")
+                self.assertEqual(result, "recovered via xkiro")
                 self.assertEqual(len(calls), 2)
                 self.assertIn("groq", calls[0][0])
-                self.assertIn("googleapis", calls[1][0])
+                self.assertIn("xkiro", calls[1][0])
 
     def test_all_providers_exhausted_uses_heuristic(self):
         from unittest.mock import patch
@@ -777,7 +891,37 @@ class TestHumanInTheLoop(unittest.TestCase):
         self.agent.initialize_state()
         self.assertIsNone(self.agent.toolbox.last_browser_result)
 
-    def test_injection_is_advertised_in_system_prompt(self):
+    def test_safe_monologue_guards_against_invalid_llm_responses(self):
+        # Regression: a provider returning None/non-string must not crash splitlines().
+        import contextlib
+        import io as _io
+        self.agent.initialize_state()
+        for bad in (None, 42, {"choices": []}, ["a"], True):
+            captured = _io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                result = self.agent._safe_monologue(bad)
+            self.assertEqual(result, "")
+            self.assertIn("initializing safety empty monologue", captured.getvalue().lower())
+        # A genuine string passes through untouched.
+        self.assertEqual(self.agent._safe_monologue("hello"), "hello")
+
+    def test_parse_plan_steps_handles_invalid_monologue(self):
+        self.agent.initialize_state()
+        self.assertEqual(self.agent._parse_plan_steps(None), [])
+        self.assertEqual(self.agent._parse_plan_steps(123), [])
+        self.assertEqual(
+            self.agent._parse_plan_steps("1. first\nnot a step\n2. second"),
+            ["1. first", "2. second"],
+        )
+
+    def test_run_cycle_survives_none_monologue(self):
+        # End-to-end: a dead provider tier must degrade to an empty plan, not a crash.
+        self.agent.generate_monologue = lambda prompt: None
+        self.agent.run_cycle()
+        self.assertEqual(self.agent.state_manager.current_state, AgentState.SLEEP)
+        self.assertEqual(self.agent.state_manager.context.active_plan, [])
+
+    def test_generate_monologue_advertises_injection_token(self):
         # The model must be told the exact token to emit.
         captured = {}
 
