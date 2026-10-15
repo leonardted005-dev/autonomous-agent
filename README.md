@@ -53,9 +53,13 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
 - **Autonomy Policy (`GATE_MODE`) — most restrictions removed by default.** The old gate parked nearly every
   commercial action (`sell`, `publish`, `pitch`, `marketplace`, `listing`, ...) in `PENDING_APPROVAL` forever.
   Now behavior is policy-driven:
-  - `balanced` (**default**): the agent may autonomously sell, publish, list, pitch, and submit work, and all
-    venture/revenue bookkeeping is never gated. Only **account creation/login verification** and **real money
-    movement** (bank transfer, withdrawal, escrow, deposits) still require your approval.
+  - `balanced` (**default**): the agent may autonomously sell, publish, list, pitch, submit work, **create
+    routine platform accounts** (capped at `MAX_ACCOUNTS_PER_DAY`, default 5/day), and **fund deposits/money-IN**
+    (capped at `MAX_DEPOSIT_PER_ACTION`, default $25 each, and `MAX_DEPOSIT_PER_DAY`, default $100/day, optionally
+    restricted to `ALLOWED_DEPOSIT_PLATFORMS`). Every autonomous signup/deposit is recorded in a persistent daily
+    `autonomy_spend` ledger (survives across runs, visible in state), and an execution-time backstop re-checks caps
+    with actual tool arguments. Only **money-OUT** (withdrawals, transfers, payouts to you) still requires your
+    approval — unless you set `ALLOW_MONEY_OUT=true` (still daily-capped).
   - `strict`: legacy behavior — commercial actions need approval again.
   - `full`: the human gate is disabled entirely (fully autonomous operation).
   - Fine-tune with `ALLOW_SELLING`, `ALLOW_PUBLISHING`, `ALLOW_MONEY_MOVEMENT` (`true`/`false`), which override
@@ -214,8 +218,10 @@ To enable cloud autonomy, configure your secrets in GitHub:
 | `OPENROUTER_API_KEY` | Your OpenRouter key from [openrouter.ai](https://openrouter.ai) (Priority 4 backup). |
 | `XKIRO_API_KEY` | Your xKiro key (Priority 2 failover provider, OpenAI-compatible `https://api.xkiro.com/v1`). |
 | `GIST_ID` | The 32-character ID of your private GitHub Gist created to store agent memory (e.g. from `https://gist.github.com/username/<GIST_ID>`). |
-| `GATE_MODE` (optional) | Autonomy policy: `balanced` (default — sell/publish/track autonomously; only account creation + real money movement need approval), `strict` (legacy — commercial actions need approval), `full` (no human gate at all). |
-| `ALLOW_SELLING` / `ALLOW_PUBLISHING` / `ALLOW_MONEY_MOVEMENT` (optional) | `true`/`false` overrides that fine-tune the gate regardless of `GATE_MODE`. |
+| `GATE_MODE` (optional) | Autonomy policy: `balanced` (default — sell/publish/sign-up/deposit autonomously under caps; only money-OUT needs approval), `strict` (legacy — commercial actions need approval), `full` (no human gate at all). |
+| `ALLOW_SELLING` / `ALLOW_PUBLISHING` / `ALLOW_MONEY_MOVEMENT` / `ALLOW_MONEY_OUT` (optional) | `true`/`false` overrides that fine-tune the gate regardless of `GATE_MODE`. `ALLOW_MONEY_OUT` alone unlocks withdrawals/transfers (still daily-capped); default `false`. |
+| `MAX_DEPOSIT_PER_ACTION` / `MAX_DEPOSIT_PER_DAY` / `MAX_ACCOUNTS_PER_DAY` (optional) | Spend guardrails for autonomous money-IN + signups. Defaults: `25` / `100` (USD) / `5` per UTC day, shared across all runs via the persistent ledger. |
+| `ALLOWED_DEPOSIT_PLATFORMS` (optional) | Comma-separated allowlist, e.g. `Gumroad,Etsy,eBay`. Empty (default) = any platform allowed, still capped. |
 | `GIT_TOKEN` (mapped to `CUSTOM_GIT_TOKEN`) | A GitHub Personal Access Token (classic with `gist` scope or fine-grained token with Gist read/write permission) so the runner can update the Gist. Stored as `GIT_TOKEN` secret, injected as `CUSTOM_GIT_TOKEN` env var to avoid collision with Actions' reserved `GITHUB_TOKEN`. |
 | `DISCORD_WEBHOOK_URL` (optional) | Discord channel webhook URL for instant approval cards (Channel Settings $\rightarrow$ Integrations $\rightarrow$ Webhooks). |
 | `SMTP_SERVER` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `NOTIFY_EMAIL` (optional) | SMTP details for approval emails (e.g. `smtp.gmail.com`, `587`). |

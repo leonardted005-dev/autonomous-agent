@@ -741,16 +741,44 @@ class TestHumanInTheLoop(unittest.TestCase):
         # Balanced (default): selling/publishing is autonomous, no gate.
         self.assertFalse(self.agent._requires_human_approval("Submit listing to marketplace and collect payment"))
         self.assertFalse(self.agent._requires_human_approval("Sell the resume template on Gumroad"))
-        # Account walls and explicit markers still gate in every non-full mode.
-        self.assertTrue(self.agent._requires_human_approval("write human_action_needed.json for registration"))
-        self.assertTrue(self.agent._requires_human_approval("create an account on Upwork and verify email"))
-        # Real money movement still gates.
+        # Account creation is autonomous in balanced mode within the daily budget.
+        self.assertFalse(self.agent._requires_human_approval("create an account on Upwork and verify email"))
+        # Small deposits (money IN) are autonomous within caps; money OUT gates.
+        self.assertFalse(self.agent._requires_human_approval("deposit $10 to fund the Gumroad listing"))
+        self.assertTrue(self.agent._requires_human_approval("deposit $5000 to fund the ad account"))
         self.assertTrue(self.agent._requires_human_approval("initiate bank transfer of $500 to escrow"))
+        self.assertTrue(self.agent._requires_human_approval("withdraw $200 to my bank account"))
+        # Explicit markers still gate in every non-full mode.
+        self.assertTrue(self.agent._requires_human_approval("write human_action_needed.json for registration"))
         self.assertFalse(self.agent._requires_human_approval("Inspect local workspace files and summarize logs"))
         # Venture/revenue bookkeeping is never gated.
         self.assertFalse(self.agent._requires_human_approval(
             'TOOL_CALL: venture_tracker_tool {"action": "record_metric", "revenue": 120}'))
         self.assertFalse(self.agent._requires_human_approval("record revenue for the resume template venture"))
+
+    def test_deposit_caps_and_allowlist(self):
+        import os
+        from unittest.mock import patch
+        agent = self.agent
+        agent.initialize_state()
+        # Over the per-action cap -> gated.
+        self.assertTrue(agent._requires_human_approval("deposit $26 to fund the listing"))
+        # Exhaust the daily budget via the ledger -> next deposit gates.
+        agent._record_autonomy_event("deposit", "seed", 95.0)
+        self.assertTrue(agent._requires_human_approval("deposit $10 more"))
+        # Platform allowlist: off-list platform gates.
+        with patch.dict(os.environ, {"ALLOWED_DEPOSIT_PLATFORMS": "Gumroad,Etsy"}, clear=False):
+            listed = AutonomousAgent(config=AgentConfig(agent_id="listed_agent"),
+                                     memory_bridge=agent.memory)
+            listed.initialize_state()
+            self.assertFalse(listed._requires_human_approval("deposit $10 to fund the Gumroad listing"))
+            self.assertTrue(listed._requires_human_approval("deposit $10 to fund RandomSite ads"))
+
+    def test_account_daily_budget_exhaustion_gates(self):
+        self.agent.initialize_state()
+        for _ in range(5):
+            self.agent._record_autonomy_event("account_created", "signup")
+        self.assertTrue(self.agent._requires_human_approval("create an account on Fiverr"))
 
     def test_strict_mode_restores_legacy_gating(self):
         import os
@@ -771,30 +799,54 @@ class TestHumanInTheLoop(unittest.TestCase):
         self.assertFalse(full_agent._requires_human_approval("initiate bank transfer of $500"))
 
     def test_account_wall_gate_not_skipped(self):
-        # High-value platform requiring registration MUST route to a gate, not be skipped.
+        # In strict mode, a platform registration wall MUST route to a gate.
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"GATE_MODE": "strict"}, clear=False):
+            strict_agent = AutonomousAgent(config=AgentConfig(agent_id="strict_wall"),
+                                           memory_bridge=self.agent.memory)
         wall_text = (
             "Discovered Upwork opportunity but access requires account creation and email "
             "verification: https://www.upwork.com/nx/signup"
         )
-        self.assertTrue(self.agent._requires_human_approval(wall_text))
-        self.agent.initialize_state()
-        proposal = self.agent._build_pending_proposal(wall_text, "PLAN")
+        self.assertTrue(strict_agent._requires_human_approval(wall_text))
+        strict_agent.initialize_state()
+        proposal = strict_agent._build_pending_proposal(wall_text, "PLAN")
         self.assertEqual(proposal["type"], "Account Creation & Verification")
         self.assertTrue(proposal["requires_account"])
         self.assertEqual(proposal["registration_link"], "https://www.upwork.com/nx/signup")
         self.assertEqual(proposal["target_platform"], "Upwork")
         self.assertIn("account creation", proposal["proposed_action"].lower())
 
+    def test_balanced_account_creation_is_autonomous_and_logged(self):
+        # Balanced: routine signup proceeds without a gate and is ledger-logged.
+        # http_poster is mocked (no network) to prove the side-effect recording.
+        # NOTE: flat JSON args — the TOOL_CALL parser does not support nested {}.
+        from unittest.mock import patch
+        self.agent.initialize_state()
+        self.assertEqual(len(self.agent.state_manager.proposals_ledger), 0)
+        with patch.object(self.agent.toolbox, "http_poster_tool",
+                          return_value={"status": "SUCCESS", "url": "u", "http_status": 200}):
+            result = self.agent._parse_and_execute_step(
+                '1. Create an account on Example and TOOL_CALL: http_poster_tool '
+                '{"url": "https://example.com/signup", "note": "signup form post"}'
+            )
+        self.assertNotIn("PENDING", json.dumps(result))
+        day = self.agent._autonomy_spend()
+        self.assertEqual(day.get("accounts_count"), 1)
+        self.assertEqual(len(self.agent.state_manager.proposals_ledger), 0)
+
     def test_account_wall_routes_to_ledger_end_to_end(self):
+        # Money-OUT still routes to the ledger end-to-end in balanced mode.
         bridge = LocalFileMemoryBridge(storage_dir=tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, bridge.storage_dir, True)
         agent = AutonomousAgent(config=AgentConfig(agent_id="wall_agent"), memory_bridge=bridge)
         agent.notifier = MagicMock()
         agent.generate_monologue = lambda prompt: (
-            "THINKING PROCESS:\n- Found high-value GitHub Sponsors lead needing login.\n"
+            "THINKING PROCESS:\n- Operator asked to pull profits out; needs approval.\n"
             "STEP-BY-STEP PLAN:\n"
-            "1. Account wall on GitHub Sponsors requires registration: https://github.com/sponsors/sign_up\n"
-            "2. Defer to human for account creation\n"
+            "1. Withdraw $150 to the operator bank account\n"
+            "2. Track listing status\n"
             "3. Transition to evaluation\n"
             "EXECUTION ASSESSMENT:\nRouting gate raised; continuing."
         )
@@ -806,9 +858,6 @@ class TestHumanInTheLoop(unittest.TestCase):
         self.assertEqual(persisted.current_state, AgentState.SLEEP.value)
         self.assertEqual(len(persisted.proposals_ledger), 1)
         stored = persisted.proposals_ledger[0]
-        self.assertEqual(stored["type"], "Account Creation & Verification")
-        self.assertTrue(stored["requires_account"])
-        self.assertIn("github.com", stored["registration_link"])
         self.assertEqual(stored["status"], "PENDING_APPROVAL")
         self.assertIsNone(stored["human_decision"])
 
@@ -1249,12 +1298,12 @@ class TestNotificationManager(unittest.TestCase):
         agent = AutonomousAgent(config=config, memory_bridge=bridge)
         agent.notifier = MagicMock()
 
-        # Force a PLAN-phase approval trigger (account creation wall — still gated
-        # under balanced autonomy, unlike sell/publish which are now autonomous).
+        # Force a PLAN-phase approval trigger. Money-OUT still gates under balanced
+        # autonomy (unlike sell/publish/signup/deposit which are now autonomous).
         agent.generate_monologue = lambda prompt: (
-            "THINKING PROCESS:\n- Marketplace opportunity detected but access blocked.\n"
+            "THINKING PROCESS:\n- Operator funds need to move out; needs approval.\n"
             "STEP-BY-STEP PLAN:\n"
-            "1. Create an account on Upwork and verify email to unlock proposals\n"
+            "1. Withdraw $300 to the operator bank account\n"
             "2. Track listing status\n"
             "3. Transition to evaluation\n"
             "EXECUTION ASSESSMENT:\nReady for review."

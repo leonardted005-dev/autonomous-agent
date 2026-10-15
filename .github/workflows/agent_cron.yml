@@ -44,11 +44,17 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
           DASHBOARD_URL: ${{ secrets.DASHBOARD_URL }}
-          # Autonomy policy: balanced (default) lets the agent sell/publish/track
-          # revenue on its own; only account creation + real money movement need
-          # approval. Set GATE_MODE to 'strict' for legacy gating, or 'full' to
-          # disable the human gate entirely. Fine-tune with ALLOW_SELLING,
-          # ALLOW_PUBLISHING, ALLOW_MONEY_MOVEMENT (true/false).
+          # Autonomy policy: balanced (default) lets the agent sell/publish/sign-up/
+          # deposit on its own under caps; only money-OUT needs approval.
+          # Set GATE_MODE to 'strict' for legacy gating, or 'full' to disable
+          # the human gate entirely. Guardrail knobs: MAX_DEPOSIT_PER_ACTION
+          # (default 25), MAX_DEPOSIT_PER_DAY (default 100),
+          # MAX_ACCOUNTS_PER_DAY (default 5), ALLOWED_DEPOSIT_PLATFORMS
+          # (comma list, empty = any), ALLOW_MONEY_OUT (default false).
           GATE_MODE: ${{ secrets.GATE_MODE }}
+          MAX_DEPOSIT_PER_ACTION: ${{ secrets.MAX_DEPOSIT_PER_ACTION }}
+          MAX_DEPOSIT_PER_DAY: ${{ secrets.MAX_DEPOSIT_PER_DAY }}
+          MAX_ACCOUNTS_PER_DAY: ${{ secrets.MAX_ACCOUNTS_PER_DAY }}
+          ALLOWED_DEPOSIT_PLATFORMS: ${{ secrets.ALLOWED_DEPOSIT_PLATFORMS }}
         run: |
           python agent_core.py

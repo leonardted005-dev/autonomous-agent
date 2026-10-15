@@ -87,15 +87,27 @@ class AgentConfig:
     # GATE_MODE controls how aggressively the Human-in-the-Loop gate fires:
     #   - "strict": legacy behavior; sell/publish/pitch/submit always need approval.
     #   - "balanced" (default): the agent may autonomously sell, publish, list,
-    #     pitch, and submit work. Only account creation/login verification and
-    #     real money movement (bank transfer, withdrawal, escrow, deposits)
-    #     still require approval.
+    #     pitch, submit work, create platform accounts, and fund deposits —
+    #     guarded by per-action caps below. Only real money-OUT (withdrawals,
+    #     transfers, payouts to the operator) still requires approval.
     #   - "full": the gate is disabled entirely (agent acts fully autonomously).
-    # Individual overrides (true/false/empty=inherit) let the operator fine-tune.
     gate_mode: str = os.getenv("GATE_MODE", "balanced").strip().lower()
     allow_selling: Optional[bool] = _optional_bool_env("ALLOW_SELLING")
     allow_publishing: Optional[bool] = _optional_bool_env("ALLOW_PUBLISHING")
     allow_money_movement: Optional[bool] = _optional_bool_env("ALLOW_MONEY_MOVEMENT")
+    # --- Money-IN + account-creation guardrails (autonomous under caps) ---
+    # Maximum single deposit/funding action the agent may perform alone.
+    max_deposit_per_action: float = float(os.getenv("MAX_DEPOSIT_PER_ACTION", "25") or "25")
+    # Maximum total deposits per UTC day across all runs (persistent ledger).
+    max_deposit_per_day: float = float(os.getenv("MAX_DEPOSIT_PER_DAY", "100") or "100")
+    # Maximum platform accounts the agent may create per UTC day.
+    max_accounts_per_day: int = int(os.getenv("MAX_ACCOUNTS_PER_DAY", "5") or "5")
+    # Comma-separated platforms the agent may deposit into / sign up for alone.
+    # Empty = any platform allowed (still capped). Example: "Gumroad,Etsy,eBay".
+    allowed_deposit_platforms: str = os.getenv("ALLOWED_DEPOSIT_PLATFORMS", "")
+    # Set true to let the agent move money OUT (withdraw/transfer) alone,
+    # still capped by the daily limit. Default False = money-out always gated.
+    allow_money_out: bool = os.getenv("ALLOW_MONEY_OUT", "false").strip().lower() in ("1", "true", "yes", "y", "on")
 
     def __post_init__(self) -> None:
         # Dataclass defaults bind at import time; the autonomy policy must
@@ -110,6 +122,24 @@ class AgentConfig:
             self.allow_publishing = _optional_bool_env("ALLOW_PUBLISHING")
         if _optional_bool_env("ALLOW_MONEY_MOVEMENT") is not None:
             self.allow_money_movement = _optional_bool_env("ALLOW_MONEY_MOVEMENT")
+        # Numeric guardrails: env wins when set and parseable, else keep value.
+        for env_name, attr, caster in (
+            ("MAX_DEPOSIT_PER_ACTION", "max_deposit_per_action", float),
+            ("MAX_DEPOSIT_PER_DAY", "max_deposit_per_day", float),
+            ("MAX_ACCOUNTS_PER_DAY", "max_accounts_per_day", int),
+        ):
+            raw = os.getenv(env_name, "").strip()
+            if raw:
+                try:
+                    self.__dict__[attr] = caster(raw)
+                except (TypeError, ValueError):
+                    pass
+        plat_raw = os.getenv("ALLOWED_DEPOSIT_PLATFORMS", None)
+        if plat_raw is not None:
+            self.allowed_deposit_platforms = plat_raw
+        out_raw = os.getenv("ALLOW_MONEY_OUT", "").strip().lower()
+        if out_raw:
+            self.allow_money_out = out_raw in ("1", "true", "yes", "y", "on")
     llm_provider: str = os.getenv(
         "LLM_PROVIDER",
         "groq" if os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY") else "openai"
@@ -1081,6 +1111,14 @@ class AutonomousAgent:
             "formulate a structured 'Human Intervention Request' detailing the platform, the reason, and the registration link, write "
             "it to a file named `human_action_needed.json`, and park that specific thread in the proposal ledger until the asset is "
             "provided. NEVER fabricate credentials or attempt to create accounts yourself.\n\n"
+            "AUTONOMOUS ACCOUNT + DEPOSIT POLICY: routine platform signups and money-IN deposits/funding run "
+            "autonomously within strict guardrails, and every one is recorded in a persistent daily ledger "
+            "(`autonomy_spend`) you can inspect. Rules: (a) create at most MAX_ACCOUNTS_PER_DAY accounts "
+            "(default 5/day) — reuse existing accounts first; (b) deposits/funding are capped at "
+            "MAX_DEPOSIT_PER_ACTION each (default $25) and MAX_DEPOSIT_PER_DAY total (default $100/day); "
+            "(c) only deposit into platforms on ALLOWED_DEPOSIT_PLATFORMS when that allowlist is set; "
+            "(d) NEVER withdraw, transfer out, or cash out operator funds alone — money-OUT always needs human "
+            "approval. When a cap or the allowlist would be exceeded, route to the human gate instead of acting.\n\n"
             "AVAILABLE TOOLBOX CAPABILITIES:\n"
             "1. web_browser_tool(url: str): Fetches HTML/RSS/text content from public feeds, job boards, or websites. "
             "It automatically injects any human-provided `session_cookies` from memory as a standard Cookie header, "
@@ -1148,8 +1186,15 @@ class AutonomousAgent:
 
         budget = max(1, int(getattr(self.config, "max_tool_calls_per_cycle", 5) or 5))
         for tool_name, args in calls[:budget]:
+            checkpoint = self._enforce_autonomy_guardrails(tool_name, args, step_desc)
+            if checkpoint is not None:
+                result["tool_calls"].append(checkpoint)
+                logger.warning(
+                    "Autonomy guardrail blocked %s: %s", tool_name, checkpoint.get("error"))
+                continue
             call_record = self._execute_single_tool_call(tool_name, args)
             result["tool_calls"].append(call_record)
+            self._record_autonomous_side_effect(tool_name, args, call_record)
             if call_record.get("status") == "ERROR":
                 result["status"] = "ERROR"
         if len(calls) > budget:
@@ -1166,6 +1211,91 @@ class AutonomousAgent:
             result["tool_output"] = first.get("tool_output")
 
         return result
+
+    def _enforce_autonomy_guardrails(
+        self, tool_name: str, args: Dict[str, Any], step_desc: str
+    ) -> Optional[Dict[str, Any]]:
+        """Execution-time backstop: re-checks money/account actions vs live caps."""
+        text = f"{tool_name} {json.dumps(args, default=str)} {step_desc or ''}"
+        low = text.lower()
+        mode = self._gate_mode()
+        if mode in ("full", "strict"):
+            return None
+
+        def _blocked(reason: str) -> Dict[str, Any]:
+            return {
+                "tool_executed": tool_name,
+                "tool_arguments": dict(args),
+                "status": "BLOCKED_BY_GUARDRAIL",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "error": reason,
+            }
+
+        is_account = self._matches_any(low, self.ACCOUNT_GATE_PATTERNS)
+        is_money_out = self._matches_any(low, self.MONEY_OUT_GATE_PATTERNS)
+        is_money_in = self._matches_any(low, self.MONEY_IN_GATE_PATTERNS)
+
+        # Bookkeeping tools never move money or create accounts themselves; the
+        # gated intent lives in the surrounding prose (which the plan-time gate
+        # already parked), so let them run so the agent can keep tracking.
+        if tool_name in ("venture_tracker_tool", "metrics_fetch_tool"):
+            is_money_out = False
+            is_money_in = False
+            is_account = False
+
+        if is_money_out and getattr(self.config, "allow_money_out", False) is not True:
+            if getattr(self.config, "allow_money_movement", None) is not True:
+                return _blocked("Money-OUT blocked: withdrawals/transfers need human approval.")
+
+        if is_money_in or (is_money_out and getattr(self.config, "allow_money_out", False) is True):
+            amount = self._extract_amount_usd(text)
+            for key in ("amount", "deposit", "value", "price", "total", "sum"):
+                raw = args.get(key)
+                if raw is not None:
+                    try:
+                        amount = float(str(raw).replace(",", "").replace("$", ""))
+                        break
+                    except (TypeError, ValueError):
+                        continue
+            if not self._deposit_platform_allowed(text):
+                return _blocked("Deposit platform not on ALLOWED_DEPOSIT_PLATFORMS allowlist.")
+            if not self._deposit_within_caps(amount):
+                return _blocked("Deposit exceeds per-action or daily cap; needs human approval.")
+
+        if is_account and not self._accounts_within_cap():
+            return _blocked("Daily account budget exhausted; needs human approval.")
+        return None
+
+    def _record_autonomous_side_effect(
+        self, tool_name: str, args: Dict[str, Any], call_record: Dict[str, Any]
+    ) -> None:
+        """Appends successful autonomous deposits/signups to the persistent ledger."""
+        try:
+            output = call_record.get("tool_output", {}) or {}
+            if str(call_record.get("status", "")).upper() == "ERROR":
+                return
+            if str(output.get("status", "")).upper() == "ERROR":
+                return
+            text = f"{tool_name} {json.dumps(args, default=str)}"
+            low = text.lower()
+            if tool_name in ("venture_tracker_tool", "metrics_fetch_tool"):
+                return  # bookkeeping tools never move money or create accounts
+            if self._matches_any(low, self.MONEY_IN_GATE_PATTERNS + self.MONEY_OUT_GATE_PATTERNS):
+                amount = self._extract_amount_usd(text)
+                for key in ("amount", "deposit", "value", "price", "total", "sum"):
+                    raw = args.get(key)
+                    if raw is not None:
+                        try:
+                            amount = float(str(raw).replace(",", "").replace("$", ""))
+                            break
+                        except (TypeError, ValueError):
+                            continue
+                self._record_autonomy_event("deposit", text[:200], amount if amount is not None else 0.0)
+            if self._matches_any(low, self.ACCOUNT_GATE_PATTERNS):
+                self._record_autonomy_event("account_created", text[:200])
+        except Exception as exc:
+            logger.warning("Autonomy ledger write skipped: %s", exc)
+
 
     @staticmethod
     def _extract_tool_calls(step_desc: str) -> List[Tuple[str, Dict[str, Any]]]:
@@ -1394,8 +1524,10 @@ class AutonomousAgent:
     # Human-in-the-Loop Dashboard Gateway helpers
     # ------------------------------------------------------------------
 
-    # Category 1 — identity/account walls. Almost always still gated (the agent
-    # cannot complete these alone); bypassed only in GATE_MODE=full.
+    # Category 1 — identity/account walls. In balanced mode the agent may create
+    # routine platform accounts itself, guarded by MAX_ACCOUNTS_PER_DAY and the
+    # autonomy ledger (every signup is recorded). Only gated when the daily
+    # account budget is exhausted, or in strict mode. Bypassed in full mode.
     ACCOUNT_GATE_PATTERNS = (
         r"account creation", r"create an account", r"sign ?up", r"registration",
         r"\bregister\b", r"registration link", r"login wall", r"log ?in",
@@ -1403,13 +1535,26 @@ class AutonomousAgent:
         r"email verification", r"two-?factor",
     )
 
-    # Category 2 — real money movement. Gated in strict/balanced, allowed when
-    # ALLOW_MONEY_MOVEMENT=true or GATE_MODE=full.
-    MONEY_GATE_PATTERNS = (
-        r"bank transfer", r"\bpaypal\b", r"\bescrow\b", r"\bwithdraw(?:al)?\b",
-        r"\bdeposit\b", r"wire transfer", r"send money", r"crypto transfer",
-        r"financial transaction",
+    # Category 2a — money OUT (operator funds leaving). ALWAYS gated in
+    # strict/balanced unless ALLOW_MONEY_OUT=true (still daily-capped).
+    MONEY_OUT_GATE_PATTERNS = (
+        r"\bwithdraw(?:al)?\b", r"wire transfer", r"send money",
+        r"bank transfer", r"\bescrow\b", r"crypto transfer",
+        r"cash ?out", r"payout to (?:me|owner|operator|bank)",
+        r"transfer (?:funds|money|profits?) (?:to|out)",
     )
+
+    # Category 2b — money IN (deposits/funding going into platforms). Allowed
+    # autonomously in balanced/full within per-action + daily caps recorded in
+    # the persistent autonomy ledger. Gated in strict mode, or when a cap or
+    # the platform allowlist would be violated.
+    MONEY_IN_GATE_PATTERNS = (
+        r"\bdeposit\b", r"fund (?:account|wallet|balance|listing)",
+        r"add funds", r"top ?up", r"\bpaypal\b", r"financial transaction",
+    )
+
+    # Backwards-compatible union (legacy name kept for tests/dashboard).
+    MONEY_GATE_PATTERNS = MONEY_OUT_GATE_PATTERNS + MONEY_IN_GATE_PATTERNS
 
     # Category 3 — commercial publishing/selling actions. Gated ONLY in strict
     # mode; in balanced/full (the default) the agent acts autonomously.
@@ -1445,20 +1590,132 @@ class AutonomousAgent:
     def _matches_any(self, low: str, patterns: Tuple[str, ...]) -> bool:
         return any(re.search(pattern, low) for pattern in patterns)
 
+    # ------------------------------------------------------------------
+    # Spend/account guardrails (persistent autonomy ledger)
+    # ------------------------------------------------------------------
+    # Every autonomous deposit + account creation is recorded per UTC day in
+    # `context.payload["autonomy_spend"]`, which persists via the Gist like the
+    # other ledgers. Caps are enforced BEFORE the action runs (plan-time text
+    # check) and again at execution time if an amount is known.
+
+    def _autonomy_spend(self) -> Dict[str, Any]:
+        ctx = self.state_manager.context if getattr(self, "state_manager", None) else None
+        payload = ctx.payload if ctx is not None and isinstance(ctx.payload, dict) else {}
+        spend = payload.get("autonomy_spend")
+        if not isinstance(spend, dict):
+            spend = {}
+            payload["autonomy_spend"] = spend
+        today = datetime.now(timezone.utc).date().isoformat()
+        day = spend.get(today)
+        if not isinstance(day, dict):
+            day = {"deposits_total": 0.0, "deposits_count": 0, "accounts_count": 0, "events": []}
+            spend[today] = day
+        return day
+
+    @staticmethod
+    def _extract_amount_usd(text: str) -> Optional[float]:
+        """Best-effort USD amount parse ($1,234.56 / 50 USD / USD 50). None if unknown."""
+        if not text:
+            return None
+        m = re.search(r"\$\s*([\d,]+(?:\.\d{1,2})?)", text)
+        if not m:
+            m = re.search(r"(?:USD|usd|\$)\s*([\d,]+(?:\.\d{1,2})?)|([\d,]+(?:\.\d{1,2})?)\s*(?:USD|usd|dollars?)", text)
+        if not m:
+            return None
+        raw = m.group(1) if m.group(1) is not None else m.group(2)
+        try:
+            return float(str(raw).replace(",", ""))
+        except (TypeError, ValueError):
+            return None
+
+    def _deposit_platform_allowed(self, text: str) -> bool:
+        allow = str(getattr(self.config, "allowed_deposit_platforms", "") or "").strip()
+        if not allow:
+            return True
+        platforms = [p.strip().lower() for p in allow.split(",") if p.strip()]
+        low = text.lower()
+        return any(p in low for p in platforms)
+
+    def _deposit_within_caps(self, amount: Optional[float]) -> bool:
+        """True if a deposit of `amount` fits per-action + daily caps."""
+        try:
+            per_action = float(getattr(self.config, "max_deposit_per_action", 25) or 25)
+            per_day = float(getattr(self.config, "max_deposit_per_day", 100) or 100)
+        except (TypeError, ValueError):
+            return False
+        if amount is not None and amount > per_action:
+            return False
+        day = self._autonomy_spend()
+        try:
+            used = float(day.get("deposits_total", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            used = 0.0
+        # Unknown amounts are treated conservatively: only allow if the whole
+        # per-action budget still fits inside the remaining daily budget.
+        projected = used + (amount if amount is not None else per_action)
+        return projected <= per_day
+
+    def _accounts_within_cap(self) -> bool:
+        try:
+            limit = int(getattr(self.config, "max_accounts_per_day", 5) or 5)
+        except (TypeError, ValueError):
+            return False
+        day = self._autonomy_spend()
+        try:
+            used = int(day.get("accounts_count", 0) or 0)
+        except (TypeError, ValueError):
+            used = 0
+        return used < limit
+
+    def _record_autonomy_event(self, kind: str, detail: str, amount: Optional[float] = None) -> None:
+        day = self._autonomy_spend()
+        event = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "kind": kind,
+            "detail": str(detail)[:300],
+        }
+        if amount is not None:
+            event["amount"] = amount
+            try:
+                day["deposits_total"] = round(float(day.get("deposits_total", 0.0) or 0.0) + float(amount), 4)
+            except (TypeError, ValueError):
+                pass
+            try:
+                day["deposits_count"] = int(day.get("deposits_count", 0) or 0) + 1
+            except (TypeError, ValueError):
+                day["deposits_count"] = 1
+        if kind == "account_created":
+            try:
+                day["accounts_count"] = int(day.get("accounts_count", 0) or 0) + 1
+            except (TypeError, ValueError):
+                day["accounts_count"] = 1
+        events = day.get("events")
+        if not isinstance(events, list):
+            events = []
+        events.append(event)
+        day["events"] = events[-50:]
+        logger.info("Autonomy ledger: %s recorded (%s).", kind, event["detail"][:120])
+
     def _requires_human_approval(self, text: str) -> bool:
         """
         Decides whether a plan step needs human approval under the autonomy policy.
 
         Venture/revenue bookkeeping is NEVER gated (it is read-only tracking).
         In balanced mode the agent may autonomously sell, publish, list, pitch,
-        and submit; only account walls and real money movement still need a human.
-        In full mode nothing is gated. Explicit human_action_needed markers
-        written by tools still gate in strict/balanced so dashboards stay useful.
+        submit, CREATE routine platform accounts, and fund DEPOSITS (money IN) —
+        the last two guarded by per-action + daily caps in the autonomy ledger.
+        Money OUT (withdrawals/transfers to the operator) always gates unless
+        ALLOW_MONEY_OUT=true. In full mode nothing is gated.
         """
         if not text:
             return False
         low = text.lower()
         mode = self._gate_mode()
+
+        # Explicit human-gate markers always gate (except in full mode): the
+        # agent deliberately wrote a help request, so honor it.
+        if mode != "full" and ("human_action_needed" in low or "human intervention" in low):
+            return True
 
         # Internal venture/revenue bookkeeping is read-only tracking — never gate.
         bookkeeping = (
@@ -1472,12 +1729,31 @@ class AutonomousAgent:
         if mode == "full":
             return False
 
-        if self._matches_any(low, self.ACCOUNT_GATE_PATTERNS):
-            return True
-        if self._matches_any(low, self.MONEY_GATE_PATTERNS):
+        # Money OUT: the one hard line. Gated unless explicitly allowed.
+        if self._matches_any(low, self.MONEY_OUT_GATE_PATTERNS):
+            if getattr(self.config, "allow_money_out", False) is True:
+                return False
             if getattr(self.config, "allow_money_movement", None) is True:
                 return False
             return True
+
+        # Money IN (deposits/funding): autonomous in balanced/full when the
+        # amount fits the per-action + daily caps and the platform allowlist.
+        if self._matches_any(low, self.MONEY_IN_GATE_PATTERNS):
+            if mode == "strict":
+                return True
+            amount = self._extract_amount_usd(text)
+            if not self._deposit_platform_allowed(text):
+                return True
+            return not self._deposit_within_caps(amount)
+
+        # Account creation: autonomous in balanced/full within the daily budget.
+        # The budget check uses the persistent ledger, so 10-20 runs/day share it.
+        if self._matches_any(low, self.ACCOUNT_GATE_PATTERNS):
+            if mode == "strict":
+                return True
+            return not self._accounts_within_cap()
+
         if self._matches_any(low, self.SELL_PUBLISH_GATE_PATTERNS):
             if mode == "strict":
                 return True
@@ -1490,8 +1766,6 @@ class AutonomousAgent:
                 if publication:
                     return True
             return False
-        if "human_action_needed" in low or "human intervention" in low:
-            return True
         return False
 
     def _classify_proposal_type(self, text: str) -> str:
