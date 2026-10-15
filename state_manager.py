@@ -74,6 +74,28 @@ class ProposalStatus(str, Enum):
 ProposalState = ProposalStatus
 
 
+class VentureStatus(str, Enum):
+    """
+    Lifecycle of a single entry in the global ventures_ledger.
+
+    Every product, program, listing, or micro-business the agent launches is
+    registered as a venture so its commercial performance can be tracked across
+    stateless runs. `PROFITABLE`, `LOSING`, and `NO_SALES` are derived health
+    signals recomputed on every metric snapshot; the rest are explicit states.
+    """
+    PLANNING = "PLANNING"
+    BUILDING = "BUILDING"
+    LIVE = "LIVE"
+    MARKETING = "MARKETING"
+    PAUSED = "PAUSED"
+    RETIRED = "RETIRED"
+    # Derived health markers (never set directly by callers, but valid to persist).
+    PROFITABLE = "PROFITABLE"
+    LOSING = "LOSING"
+    NO_SALES = "NO_SALES"
+    BREAKEVEN = "BREAKEVEN"
+
+
 @dataclass
 class StateTransitionRecord:
     """Historical record of an individual state transition."""
@@ -103,6 +125,11 @@ class AgentContext:
     # `pending_proposal` dictionary: any number of tasks may wait here for human
     # verification while the agent keeps executing the rest of its pipeline.
     proposals_ledger: List[Dict[str, Any]] = field(default_factory=list)
+    # Persistent global venture/portfolio ledger. Every product, program, listing,
+    # or micro-business the agent launches is registered here with its commercial
+    # metrics (revenue, costs, units sold, visitors) so performance is tracked
+    # across stateless runs. Deliberately survives `reset_for_new_cycle()`.
+    ventures_ledger: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes context to a plain JSON-compatible dictionary."""
@@ -117,6 +144,7 @@ class AgentContext:
             "errors": self.errors,
             "history": self.history,
             "proposals_ledger": self.proposals_ledger,
+            "ventures_ledger": self.ventures_ledger,
         }
 
     @classmethod
@@ -134,6 +162,12 @@ class AgentContext:
             if isinstance(raw_ledger, list) else []
         )
 
+        raw_ventures = data.get("ventures_ledger", [])
+        ventures = (
+            [dict(entry) for entry in raw_ventures if isinstance(entry, dict)]
+            if isinstance(raw_ventures, list) else []
+        )
+
         return cls(
             run_id=data.get("run_id", "unknown_run"),
             cycle_count=data.get("cycle_count", 0),
@@ -145,6 +179,7 @@ class AgentContext:
             errors=data.get("errors", []),
             history=data.get("history", []),
             proposals_ledger=ledger,
+            ventures_ledger=ventures,
         )
 
 
@@ -311,6 +346,263 @@ class StateManager:
             key = str(entry.get("status", "UNKNOWN")).strip().upper() or "UNKNOWN"
             summary[key] = summary.get(key, 0) + 1
         return summary
+
+    # ------------------------------------------------------------------
+    # Venture / Portfolio Ledger
+    # ------------------------------------------------------------------
+    # The ventures_ledger is the agent's commercial memory: every product,
+    # program, listing, or micro-business it launches is registered here and
+    # tracked across stateless runs. Unlike proposals_ledger it stores money
+    # facts (revenue, costs, units sold, visitors) and derives a health signal
+    # so the agent can tell winners from losers without a human in the loop.
+
+    def ventures(self) -> List[Dict[str, Any]]:
+        """The live ventures_ledger array (never None)."""
+        ledger = self.context.ventures_ledger
+        return ledger if isinstance(ledger, list) else []
+
+    @staticmethod
+    def compute_venture_health(venture: Dict[str, Any]) -> str:
+        """
+        Derives a commercial health signal for a venture from its metrics.
+
+        Rules (first match wins):
+          - RETIRED ventures are always RETIRED.
+          - No revenue recorded AND zero units sold => NO_SALES (nobody is buying).
+          - Revenue > costs  => PROFITABLE.
+          - Revenue == costs and revenue > 0 => BREAKEVEN.
+          - Revenue < costs  => LOSING (burning money).
+          - Otherwise (no financial data at all) => UNKNOWN.
+        """
+        if str(venture.get("status", "")).upper() == VentureStatus.RETIRED.value:
+            return VentureStatus.RETIRED.value
+
+        try:
+            revenue = float(venture.get("revenue", 0) or 0)
+        except (TypeError, ValueError):
+            revenue = 0.0
+        try:
+            costs = float(venture.get("costs", 0) or 0)
+        except (TypeError, ValueError):
+            costs = 0.0
+        try:
+            units = int(venture.get("units_sold", 0) or 0)
+        except (TypeError, ValueError):
+            units = 0
+
+        if revenue == 0.0 and units <= 0:
+            # Either genuinely no sales, or never had financial data recorded.
+            if "revenue" not in venture and "units_sold" not in venture:
+                return "UNKNOWN"
+            return VentureStatus.NO_SALES.value
+
+        profit = revenue - costs
+        if profit > 0:
+            return VentureStatus.PROFITABLE.value
+        if profit == 0:
+            return VentureStatus.BREAKEVEN.value
+        return VentureStatus.LOSING.value
+
+    @staticmethod
+    def _recompute_health(venture: Dict[str, Any]) -> Dict[str, Any]:
+        """Stamps profit + health onto a venture dict in place (and returns it)."""
+        try:
+            revenue = float(venture.get("revenue", 0) or 0)
+        except (TypeError, ValueError):
+            revenue = 0.0
+        try:
+            costs = float(venture.get("costs", 0) or 0)
+        except (TypeError, ValueError):
+            costs = 0.0
+        venture["revenue"] = revenue
+        venture["costs"] = costs
+        venture["profit"] = round(revenue - costs, 4)
+        venture["health"] = StateManager.compute_venture_health(venture)
+        venture["last_checked"] = datetime.now(timezone.utc).isoformat()
+        return venture
+
+    def register_venture(self, venture: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Registers a new venture (product/program/listing) in the portfolio ledger.
+
+        A unique `venture_id` is assigned if absent, health/profit are computed,
+        and the entry is appended. Re-registering the same `venture_id` returns
+        the existing entry unchanged (mirrors append_proposal dedup semantics).
+        """
+        entry = dict(venture)
+        venture_id = str(entry.get("venture_id") or entry.get("id") or "").strip()
+        if not venture_id:
+            venture_id = hashlib_short_id(entry)
+        entry["venture_id"] = venture_id
+        entry.setdefault("status", VentureStatus.LIVE.value)
+        entry.setdefault("revenue", 0.0)
+        entry.setdefault("costs", 0.0)
+        entry.setdefault("units_sold", 0)
+        entry.setdefault("visitors", 0)
+        entry.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+
+        for existing in self.ventures():
+            if isinstance(existing, dict) and existing.get("venture_id") == venture_id:
+                logger.info("Venture %s already present in ledger; keeping existing entry.", venture_id)
+                return existing
+
+        self._recompute_health(entry)
+        self.ventures().append(entry)
+        logger.info(
+            "Venture register: %s (%s) added. Portfolio depth now %d.",
+            venture_id, entry.get("name", "Unnamed"), len(self.ventures()),
+        )
+        return entry
+
+    def get_venture(self, venture_id: str) -> Optional[Dict[str, Any]]:
+        """Looks up a single venture by its unique ID."""
+        for entry in self.ventures():
+            if isinstance(entry, dict) and entry.get("venture_id") == venture_id:
+                return entry
+        return None
+
+    def update_venture(self, venture_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Applies a partial update to a venture and recomputes profit + health.
+
+        Unknown IDs return None. The `venture_id` field itself is immutable.
+        """
+        entry = self.get_venture(venture_id)
+        if entry is None:
+            logger.warning("Venture update target %s not found in ledger.", venture_id)
+            return None
+        for key, value in updates.items():
+            if key in ("venture_id", "id"):
+                continue
+            entry[key] = value
+        self._recompute_health(entry)
+        logger.info(
+            "Venture update: %s -> status=%s health=%s profit=%s",
+            venture_id, entry.get("status"), entry.get("health"), entry.get("profit"),
+        )
+        return entry
+
+    def record_venture_metric(
+        self,
+        venture_id: str,
+        revenue: Optional[float] = None,
+        costs: Optional[float] = None,
+        units_sold: Optional[int] = None,
+        visitors: Optional[int] = None,
+        note: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Records a point-in-time commercial metric snapshot for a venture.
+
+        Numeric fields are treated as cumulative-to-date values (the latest
+        snapshot wins). A bounded history of snapshots is kept so trends
+        (rising/falling sales) remain visible across runs. Health is recomputed.
+        """
+        entry = self.get_venture(venture_id)
+        if entry is None:
+            logger.warning("Venture metric target %s not found in ledger.", venture_id)
+            return None
+
+        if revenue is not None:
+            try:
+                entry["revenue"] = float(revenue)
+            except (TypeError, ValueError):
+                pass
+        if costs is not None:
+            try:
+                entry["costs"] = float(costs)
+            except (TypeError, ValueError):
+                pass
+        if units_sold is not None:
+            try:
+                entry["units_sold"] = int(units_sold)
+            except (TypeError, ValueError):
+                pass
+        if visitors is not None:
+            try:
+                entry["visitors"] = int(visitors)
+            except (TypeError, ValueError):
+                pass
+
+        snapshot = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "revenue": entry.get("revenue", 0.0),
+            "costs": entry.get("costs", 0.0),
+            "units_sold": entry.get("units_sold", 0),
+            "visitors": entry.get("visitors", 0),
+        }
+        if note:
+            snapshot["note"] = str(note)
+
+        history = entry.get("history")
+        if not isinstance(history, list):
+            history = []
+        history.append(snapshot)
+        # Keep history bounded so the Gist state file stays small.
+        entry["history"] = history[-20:]
+
+        self._recompute_health(entry)
+        logger.info(
+            "Venture metric: %s revenue=%s costs=%s units=%s health=%s",
+            venture_id, entry.get("revenue"), entry.get("costs"),
+            entry.get("units_sold"), entry.get("health"),
+        )
+        return entry
+
+    def portfolio_summary(self) -> Dict[str, Any]:
+        """
+        Aggregates the whole portfolio into a single commercial picture.
+
+        Returns total revenue/costs/profit, counts per health bucket, and the
+        best/worst performers. Used to brief the agent each PLAN/EVALUATE phase
+        so it can double down on winners and fix or kill losers.
+        """
+        ventures = [v for v in self.ventures() if isinstance(v, dict)]
+        total_revenue = 0.0
+        total_costs = 0.0
+        total_units = 0
+        total_visitors = 0
+        health_counts: Dict[str, int] = {}
+        for v in ventures:
+            try:
+                total_revenue += float(v.get("revenue", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                total_costs += float(v.get("costs", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                total_units += int(v.get("units_sold", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                total_visitors += int(v.get("visitors", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            health = str(v.get("health", "UNKNOWN"))
+            health_counts[health] = health_counts.get(health, 0) + 1
+
+        def _profit_of(v: Dict[str, Any]) -> float:
+            try:
+                return float(v.get("profit", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        best = max(ventures, key=_profit_of, default=None)
+        worst = min(ventures, key=_profit_of, default=None)
+
+        return {
+            "total_ventures": len(ventures),
+            "total_revenue": round(total_revenue, 4),
+            "total_costs": round(total_costs, 4),
+            "total_profit": round(total_revenue - total_costs, 4),
+            "total_units_sold": total_units,
+            "total_visitors": total_visitors,
+            "health_counts": health_counts,
+            "best_venture": best.get("venture_id") if best else None,
+            "worst_venture": worst.get("venture_id") if worst else None,
+        }
 
 
 def hashlib_short_id(entry: Dict[str, Any]) -> str:

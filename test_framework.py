@@ -738,9 +738,37 @@ class TestHumanInTheLoop(unittest.TestCase):
         self.assertIsNone(proposal["human_decision"])
 
     def test_approval_trigger_detection(self):
-        self.assertTrue(self.agent._requires_human_approval("Submit listing to marketplace and collect payment"))
+        # Balanced (default): selling/publishing is autonomous, no gate.
+        self.assertFalse(self.agent._requires_human_approval("Submit listing to marketplace and collect payment"))
+        self.assertFalse(self.agent._requires_human_approval("Sell the resume template on Gumroad"))
+        # Account walls and explicit markers still gate in every non-full mode.
         self.assertTrue(self.agent._requires_human_approval("write human_action_needed.json for registration"))
+        self.assertTrue(self.agent._requires_human_approval("create an account on Upwork and verify email"))
+        # Real money movement still gates.
+        self.assertTrue(self.agent._requires_human_approval("initiate bank transfer of $500 to escrow"))
         self.assertFalse(self.agent._requires_human_approval("Inspect local workspace files and summarize logs"))
+        # Venture/revenue bookkeeping is never gated.
+        self.assertFalse(self.agent._requires_human_approval(
+            'TOOL_CALL: venture_tracker_tool {"action": "record_metric", "revenue": 120}'))
+        self.assertFalse(self.agent._requires_human_approval("record revenue for the resume template venture"))
+
+    def test_strict_mode_restores_legacy_gating(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"GATE_MODE": "strict"}, clear=False):
+            strict_agent = AutonomousAgent(config=AgentConfig(agent_id="strict_agent"),
+                                           memory_bridge=self.agent.memory)
+        self.assertTrue(strict_agent._requires_human_approval("Submit listing to marketplace and collect payment"))
+        self.assertTrue(strict_agent._requires_human_approval("Sell the resume template on Gumroad"))
+
+    def test_full_mode_disables_all_gates(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"GATE_MODE": "full"}, clear=False):
+            full_agent = AutonomousAgent(config=AgentConfig(agent_id="full_agent"),
+                                         memory_bridge=self.agent.memory)
+        self.assertFalse(full_agent._requires_human_approval("create an account on Upwork and verify email"))
+        self.assertFalse(full_agent._requires_human_approval("initiate bank transfer of $500"))
 
     def test_account_wall_gate_not_skipped(self):
         # High-value platform requiring registration MUST route to a gate, not be skipped.
@@ -1221,11 +1249,12 @@ class TestNotificationManager(unittest.TestCase):
         agent = AutonomousAgent(config=config, memory_bridge=bridge)
         agent.notifier = MagicMock()
 
-        # Force a PLAN-phase approval trigger (external platform + payment)
+        # Force a PLAN-phase approval trigger (account creation wall — still gated
+        # under balanced autonomy, unlike sell/publish which are now autonomous).
         agent.generate_monologue = lambda prompt: (
-            "THINKING PROCESS:\n- Marketplace opportunity detected.\n"
+            "THINKING PROCESS:\n- Marketplace opportunity detected but access blocked.\n"
             "STEP-BY-STEP PLAN:\n"
-            "1. Submit freelance pitch to Upwork requesting $300 payment\n"
+            "1. Create an account on Upwork and verify email to unlock proposals\n"
             "2. Track listing status\n"
             "3. Transition to evaluation\n"
             "EXECUTION ASSESSMENT:\nReady for review."
@@ -1521,6 +1550,123 @@ class TestCloudMemoryBridge(unittest.TestCase):
         self.assertIsInstance(bridge2, GitHubGistMemoryBridge)
         self.assertEqual(bridge2.gist_id, "gist_abc_123")
         self.assertEqual(bridge2.github_token, "ghp_test_token")
+
+class TestVentureLedger(unittest.TestCase):
+    def setUp(self):
+        self.context = AgentContext(run_id="venture_run_1", cycle_count=1)
+        self.fsm = StateManager(self.context)
+
+    def test_register_assigns_id_and_defaults(self):
+        entry = self.fsm.register_venture({"name": "Resume Template Pack"})
+        self.assertTrue(entry.get("venture_id"))
+        self.assertEqual(entry["status"], "LIVE")
+        self.assertEqual(entry["health"], "NO_SALES")
+        self.assertEqual(entry["profit"], 0.0)
+        self.assertEqual(len(self.fsm.ventures()), 1)
+
+    def test_register_dedups_on_venture_id(self):
+        first = self.fsm.register_venture({"venture_id": "v_abc", "name": "A"})
+        second = self.fsm.register_venture({"venture_id": "v_abc", "name": "B"})
+        self.assertIs(first, second)
+        self.assertEqual(len(self.fsm.ventures()), 1)
+
+    def test_health_transitions(self):
+        self.fsm.register_venture({"venture_id": "v_win", "name": "Winner"})
+        self.fsm.record_venture_metric("v_win", revenue=120.0, costs=20.0, units_sold=6)
+        self.assertEqual(self.fsm.get_venture("v_win")["health"], "PROFITABLE")
+        self.fsm.register_venture({"venture_id": "v_lose", "name": "Loser"})
+        self.fsm.record_venture_metric("v_lose", revenue=30.0, costs=100.0, units_sold=2)
+        self.assertEqual(self.fsm.get_venture("v_lose")["health"], "LOSING")
+        self.fsm.register_venture({"venture_id": "v_flat", "name": "Flat"})
+        self.fsm.record_venture_metric("v_flat", revenue=50.0, costs=50.0, units_sold=5)
+        self.assertEqual(self.fsm.get_venture("v_flat")["health"], "BREAKEVEN")
+
+    def test_metric_history_bounded(self):
+        self.fsm.register_venture({"venture_id": "v_hist", "name": "Hist"})
+        for i in range(25):
+            self.fsm.record_venture_metric("v_hist", revenue=float(i), units_sold=i)
+        self.assertEqual(len(self.fsm.get_venture("v_hist")["history"]), 20)
+
+    def test_portfolio_summary_aggregates(self):
+        self.fsm.register_venture({"venture_id": "v1", "name": "One"})
+        self.fsm.record_venture_metric("v1", revenue=200.0, costs=50.0, units_sold=10, visitors=300)
+        self.fsm.register_venture({"venture_id": "v2", "name": "Two"})
+        self.fsm.record_venture_metric("v2", revenue=10.0, costs=90.0, units_sold=1, visitors=40)
+        summary = self.fsm.portfolio_summary()
+        self.assertEqual(summary["total_ventures"], 2)
+        self.assertEqual(summary["total_revenue"], 210.0)
+        self.assertEqual(summary["total_profit"], 70.0)
+        self.assertEqual(summary["total_units_sold"], 11)
+        self.assertEqual(summary["health_counts"].get("PROFITABLE"), 1)
+        self.assertEqual(summary["health_counts"].get("LOSING"), 1)
+        self.assertEqual(summary["best_venture"], "v1")
+        self.assertEqual(summary["worst_venture"], "v2")
+
+    def test_context_round_trip(self):
+        self.fsm.register_venture({"venture_id": "v_ser", "name": "Ser"})
+        payload = self.context.to_dict()
+        self.assertIn("ventures_ledger", payload)
+        restored = AgentContext.from_dict(payload)
+        self.assertEqual(restored.ventures_ledger[0]["venture_id"], "v_ser")
+
+    def test_short_term_state_persists_ventures(self):
+        state = ShortTermState(run_id="r", current_state="SLEEP",
+                               ventures_ledger=[{"venture_id": "v_x", "name": "X"}])
+        payload = state.to_dict()
+        self.assertEqual(payload["ventures_ledger"], [{"venture_id": "v_x", "name": "X"}])
+        restored = ShortTermState.from_dict(payload)
+        self.assertEqual(restored.ventures_ledger[0]["venture_id"], "v_x")
+        legacy = ShortTermState.from_dict({"run_id": "old", "current_state": "SLEEP"})
+        self.assertEqual(legacy.ventures_ledger, [])
+
+
+class TestVentureTools(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.bridge = LocalFileMemoryBridge(storage_dir=self.test_dir)
+        self.config = AgentConfig(agent_id="venture_tool_agent", max_steps_per_run=3)
+        self.agent = AutonomousAgent(config=self.config, memory_bridge=self.bridge)
+        self.agent.initialize_state()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_tracker_register_record_summary(self):
+        reg = self.agent._venture_tracker_tool(action="register", name="Ebook Pack",
+                                               platform="Gumroad", costs=15.0)
+        self.assertEqual(reg["status"], "SUCCESS")
+        vid = reg["venture"]["venture_id"]
+        rec = self.agent._venture_tracker_tool(action="record_metric", venture_id=vid,
+                                               revenue=90.0, units_sold=9, visitors=200)
+        self.assertEqual(rec["status"], "SUCCESS")
+        self.assertEqual(rec["venture"]["health"], "PROFITABLE")
+        summary = self.agent._venture_tracker_tool(action="summary")
+        self.assertEqual(summary["summary"]["total_revenue"], 90.0)
+        self.assertEqual(summary["summary"]["total_profit"], 75.0)
+        self.agent.persist_current_state()
+        persisted = self.bridge.load_short_term_state("venture_tool_agent")
+        self.assertEqual(len(persisted.ventures_ledger), 1)
+
+    def test_tracker_unknown_venture_errors(self):
+        out = self.agent._venture_tracker_tool(action="record_metric", venture_id="nope", revenue=5)
+        self.assertEqual(out["status"], "ERROR")
+
+    def test_metrics_fetch_extracts_signals(self):
+        from unittest.mock import patch
+        with patch.object(self.agent.toolbox, "web_browser_tool",
+                          return_value={"status": "SUCCESS", "url": "u",
+                                        "content_preview": "1,234 sales, 4.8 out of 5, 87 reviews"}):
+            out = self.agent.toolbox.execute_tool("metrics_fetch_tool", {"url": "http://x"})
+        self.assertEqual(out["status"], "SUCCESS")
+        self.assertEqual(out["signals"]["units_sold"], "1234")
+        self.assertEqual(out["signals"]["rating"], "4.8")
+        self.assertEqual(out["signals"]["reviews"], "87")
+
+    def test_dispatch_executes_venture_tool(self):
+        record = self.agent._execute_single_tool_call(
+            "venture_tracker_tool", {"action": "register", "name": "Checklist"})
+        self.assertEqual(record["tool_output"]["status"], "SUCCESS")
+
 
 if __name__ == "__main__":
     unittest.main()

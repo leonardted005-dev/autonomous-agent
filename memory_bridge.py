@@ -33,15 +33,17 @@ class ShortTermState:
     context_data: Dict[str, Any] = field(default_factory=dict)
     session_cookies: Dict[str, str] = field(default_factory=dict)
     proposals_ledger: List[Dict[str, Any]] = field(default_factory=list)
+    ventures_ledger: List[Dict[str, Any]] = field(default_factory=list)
     last_updated: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
         """
         Serializes to a plain JSON-compatible dictionary.
 
-        `proposals_ledger` and `session_cookies` are always emitted (never omitted when
-        empty) so downstream readers and cloud state migrations can rely on the keys
-        being structurally present regardless of how this instance was constructed.
+        `proposals_ledger`, `ventures_ledger`, and `session_cookies` are always emitted
+        (never omitted when empty) so downstream readers and cloud state migrations can
+        rely on the keys being structurally present regardless of how this instance was
+        constructed.
         """
         return {
             "run_id": self.run_id,
@@ -51,6 +53,7 @@ class ShortTermState:
             "context_data": self.context_data if isinstance(self.context_data, dict) else {},
             "session_cookies": self.session_cookies if isinstance(self.session_cookies, dict) else {},
             "proposals_ledger": self._normalize_ledger(self.proposals_ledger),
+            "ventures_ledger": self._normalize_ledger(self.ventures_ledger),
             "last_updated": self.last_updated,
         }
 
@@ -85,6 +88,11 @@ class ShortTermState:
         if raw_ledger is None:
             raw_ledger = context_data.get("proposals_ledger", [])
 
+        # Same defensive routing for the venture/portfolio ledger.
+        raw_ventures = data.get("ventures_ledger", None)
+        if raw_ventures is None:
+            raw_ventures = context_data.get("ventures_ledger", [])
+
         raw_plan = data.get("active_plan", [])
 
         return cls(
@@ -95,6 +103,7 @@ class ShortTermState:
             context_data=context_data,
             session_cookies=cookies,
             proposals_ledger=cls._normalize_ledger(raw_ledger),
+            ventures_ledger=cls._normalize_ledger(raw_ventures),
             last_updated=data.get("last_updated", datetime.now(timezone.utc).isoformat()),
         )
 

@@ -13,6 +13,11 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
      `DENIED`). Helper surface: `append_proposal()`, `get_proposal()`, `remove_proposal()`, `purge_proposals()`,
      `pending_proposals()`, `ledger_summary()`. The ledger is global state and deliberately survives
      `reset_for_new_cycle()`.
+   - Owns the **Venture Portfolio Ledger** (`AgentContext.ventures_ledger`): a persistent global array of every
+     product/program the agent launched. Helper surface: `register_venture()`, `get_venture()`,
+     `update_venture()`, `record_venture_metric()`, `portfolio_summary()`, plus `compute_venture_health()` which
+     derives `PROFITABLE` / `LOSING` / `NO_SALES` / `BREAKEVEN` from revenue vs costs vs units sold. Also
+     survives `reset_for_new_cycle()`.
 
 2. **`memory_bridge.py`**:
    - Defines `BaseMemoryBridge`, an abstract interface decoupling the agent logic from external database backends (Supabase, DynamoDB, Redis, S3, or GitHub artifacts).
@@ -27,15 +32,34 @@ Stateless, continuous, autonomous agent framework designed to execute on free st
      and immediately resume the plan, then reconcile human decisions on the next wake-up.
    - Implements fault-tolerant error containment: exceptions transition to `ERROR` and persist context before gracefully winding down to `SLEEP`.
 
-   - Embeds standard Python `Toolbox` with 3 zero-dependency capabilities:
+   - Embeds standard Python `Toolbox` with 5 zero-dependency capabilities:
      - `web_browser_tool(url)`: Fetches and cleans textual content from public RSS feeds, job boards, or websites via `urllib.request`.
      - `file_writer_tool(filepath, content)`: Writes scripts, portfolios, reports, or application files into the local workspace with directory traversal containment.
      - `http_poster_tool(url, payload)`: Sends HTTP POST requests to simulate external platform interactions, registrations, or work submissions.
+     - `metrics_fetch_tool(url, venture_id)`: Scrapes a public product/listing page and extracts commercial signals (`units_sold`, `revenue`, `reviews`, `rating`, `visitors`) via best-effort regex parsing, so the agent can check how its launched products are performing.
+     - `venture_tracker_tool(action, ...)`: the agent's **commercial memory** (state-aware, runs on the orchestrator). Actions: `register` (log a new product/program the moment it launches), `record_metric` (snapshot cumulative revenue/costs/units/visitors), `list`/`get`/`update`, and `summary` (portfolio P&L + health counts). Never gated — it is internal bookkeeping.
    - Implements a production-grade 5-provider `LLMClient` Fallback Priority Ledger: **Groq -> xKiro -> Gemini -> Mistral -> OpenRouter**. On HTTP 429/400-class errors or timeouts it prints "[WARNING] Active provider failed with error. Diverting prompt state to the next priority engine backup..." and replays the exact prompt against the next engine. Each free short-text tier sends a strict `max_tokens: 500` cap (`LLMClient.MAX_OUTPUT_TOKENS`) so providers do not pre-emptively reject requests with HTTP 429 on oversized expected output-window (OTPM) calculations; paid completions endpoints omit the field unless a cap is declared.
    - Instructs the agent with an open-ended discovery objective: analyze long-term memory, choose lucrative or educational digital tasks, execute tools dynamically, and log successes/failures for continuous self-improvement.
 
 ### Advanced Autonomy Features
 
+- **Venture Portfolio Ledger (commercial tracking)** — every product, program, listing, or micro-business the agent
+  launches is registered in a persistent global `ventures_ledger` (mirroring `proposals_ledger`, surviving every
+  stateless run via the Gist) with revenue, costs, auto-computed profit, units sold, visitors, and a bounded metric
+  history. Each snapshot recomputes a health signal — `PROFITABLE` (scale it), `LOSING` (fix or retire it),
+  `NO_SALES` (nobody is buying — market it or kill it), `BREAKEVEN` — and `portfolio_summary()` aggregates total
+  P&L plus best/worst performers. The summary is injected into every PLAN prompt, so the agent wakes up already
+  knowing which ventures are winning and which need attention. The dashboard renders the portfolio as a 💰 panel.
+- **Autonomy Policy (`GATE_MODE`) — most restrictions removed by default.** The old gate parked nearly every
+  commercial action (`sell`, `publish`, `pitch`, `marketplace`, `listing`, ...) in `PENDING_APPROVAL` forever.
+  Now behavior is policy-driven:
+  - `balanced` (**default**): the agent may autonomously sell, publish, list, pitch, and submit work, and all
+    venture/revenue bookkeeping is never gated. Only **account creation/login verification** and **real money
+    movement** (bank transfer, withdrawal, escrow, deposits) still require your approval.
+  - `strict`: legacy behavior — commercial actions need approval again.
+  - `full`: the human gate is disabled entirely (fully autonomous operation).
+  - Fine-tune with `ALLOW_SELLING`, `ALLOW_PUBLISHING`, `ALLOW_MONEY_MOVEMENT` (`true`/`false`), which override
+    the mode. Set these as repo **Secrets** (`GATE_MODE` is already wired into `agent_cron.yml`) or env vars.
 - **Non-Blocking Multi-Task Proposal Ledger** — the single blocking `pending_proposal` dictionary is gone. When the
   agent meets a task that needs human intervention, an account wall, or external publishing, it packages the action
   and appends it to the global `proposals_ledger` with a unique ID and a status of `PENDING_APPROVAL`, then
@@ -190,6 +214,8 @@ To enable cloud autonomy, configure your secrets in GitHub:
 | `OPENROUTER_API_KEY` | Your OpenRouter key from [openrouter.ai](https://openrouter.ai) (Priority 4 backup). |
 | `XKIRO_API_KEY` | Your xKiro key (Priority 2 failover provider, OpenAI-compatible `https://api.xkiro.com/v1`). |
 | `GIST_ID` | The 32-character ID of your private GitHub Gist created to store agent memory (e.g. from `https://gist.github.com/username/<GIST_ID>`). |
+| `GATE_MODE` (optional) | Autonomy policy: `balanced` (default — sell/publish/track autonomously; only account creation + real money movement need approval), `strict` (legacy — commercial actions need approval), `full` (no human gate at all). |
+| `ALLOW_SELLING` / `ALLOW_PUBLISHING` / `ALLOW_MONEY_MOVEMENT` (optional) | `true`/`false` overrides that fine-tune the gate regardless of `GATE_MODE`. |
 | `GIT_TOKEN` (mapped to `CUSTOM_GIT_TOKEN`) | A GitHub Personal Access Token (classic with `gist` scope or fine-grained token with Gist read/write permission) so the runner can update the Gist. Stored as `GIT_TOKEN` secret, injected as `CUSTOM_GIT_TOKEN` env var to avoid collision with Actions' reserved `GITHUB_TOKEN`. |
 | `DISCORD_WEBHOOK_URL` (optional) | Discord channel webhook URL for instant approval cards (Channel Settings $\rightarrow$ Integrations $\rightarrow$ Webhooks). |
 | `SMTP_SERVER` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `NOTIFY_EMAIL` (optional) | SMTP details for approval emails (e.g. `smtp.gmail.com`, `587`). |

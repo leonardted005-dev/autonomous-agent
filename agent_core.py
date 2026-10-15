@@ -65,12 +65,51 @@ logging.basicConfig(
 logger = logging.getLogger("AgentCore")
 
 
+def _optional_bool_env(name: str) -> Optional[bool]:
+    """Reads an env var as tri-state bool: true/false, or None when unset."""
+    raw = os.getenv(name, "").strip().lower()
+    if raw in ("1", "true", "yes", "y", "on"):
+        return True
+    if raw in ("0", "false", "no", "n", "off"):
+        return False
+    return None
+
+
 @dataclass
 class AgentConfig:
     """Agent runtime configuration sourced from environment variables."""
     agent_id: str = os.getenv("AGENT_ID", "default_stateless_agent")
     max_steps_per_run: int = int(os.getenv("MAX_STEPS_PER_RUN", "5"))
     max_tool_calls_per_cycle: int = int(os.getenv("MAX_TOOL_CALLS_PER_CYCLE", str(MAX_CHAIN_STEPS_PER_CYCLE)))
+    # ------------------------------------------------------------------
+    # Autonomy policy (restriction relaxation).
+    # ------------------------------------------------------------------
+    # GATE_MODE controls how aggressively the Human-in-the-Loop gate fires:
+    #   - "strict": legacy behavior; sell/publish/pitch/submit always need approval.
+    #   - "balanced" (default): the agent may autonomously sell, publish, list,
+    #     pitch, and submit work. Only account creation/login verification and
+    #     real money movement (bank transfer, withdrawal, escrow, deposits)
+    #     still require approval.
+    #   - "full": the gate is disabled entirely (agent acts fully autonomously).
+    # Individual overrides (true/false/empty=inherit) let the operator fine-tune.
+    gate_mode: str = os.getenv("GATE_MODE", "balanced").strip().lower()
+    allow_selling: Optional[bool] = _optional_bool_env("ALLOW_SELLING")
+    allow_publishing: Optional[bool] = _optional_bool_env("ALLOW_PUBLISHING")
+    allow_money_movement: Optional[bool] = _optional_bool_env("ALLOW_MONEY_MOVEMENT")
+
+    def __post_init__(self) -> None:
+        # Dataclass defaults bind at import time; the autonomy policy must
+        # resolve at construction time so GATE_MODE / ALLOW_* env vars (and
+        # test-time patch.dict) actually take effect per agent instance.
+        self.gate_mode = str(os.getenv("GATE_MODE", self.gate_mode or "balanced")).strip().lower()
+        if self.gate_mode not in ("strict", "balanced", "full"):
+            self.gate_mode = "balanced"
+        if _optional_bool_env("ALLOW_SELLING") is not None:
+            self.allow_selling = _optional_bool_env("ALLOW_SELLING")
+        if _optional_bool_env("ALLOW_PUBLISHING") is not None:
+            self.allow_publishing = _optional_bool_env("ALLOW_PUBLISHING")
+        if _optional_bool_env("ALLOW_MONEY_MOVEMENT") is not None:
+            self.allow_money_movement = _optional_bool_env("ALLOW_MONEY_MOVEMENT")
     llm_provider: str = os.getenv(
         "LLM_PROVIDER",
         "groq" if os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY") else "openai"
@@ -362,6 +401,77 @@ class Toolbox:
             logger.warning("http_poster_tool error: %s", msg)
             return {"status": "ERROR", "url": url, "error": msg}
 
+    def metrics_fetch_tool(
+        self,
+        url: str,
+        session_cookies: Optional[Dict[str, str]] = None,
+        venture_id: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Scrapes a public product/listing page for commercial performance signals.
+
+        Extracts candidate `units_sold`, `revenue`, `rating`, `reviews`, and
+        `visitors` from common marketplace phrasing (Gumroad, Etsy, eBay,
+        Shopify, itch.io, etc.). Values are best-effort regex parses and are
+        returned as strings so the caller (or the venture_tracker) can decide
+        whether to trust and record them. Never raises on partial data.
+        """
+        page = self.web_browser_tool(url, session_cookies=session_cookies)
+        if page.get("status") != "SUCCESS":
+            return {
+                "status": "ERROR",
+                "url": url,
+                "venture_id": venture_id,
+                "error": page.get("error", "Failed to fetch the metrics page."),
+            }
+
+        text = str(page.get("content_preview", "") or "")
+        # web_browser_tool stores the full clean payload separately; prefer it.
+        full_text = getattr(self, "last_browser_result", None) or text
+        haystack = f"{text} {full_text}"
+
+        def _first(patterns: Tuple[str, ...]) -> Optional[str]:
+            for pat in patterns:
+                m = re.search(pat, haystack, re.IGNORECASE)
+                if m:
+                    return m.group(1).strip().replace(",", "")
+            return None
+
+        signals: Dict[str, Any] = {
+            "units_sold": _first((
+                r"([\d,]+)\s*(?:sales|sold|units sold|purchases?|orders?)",
+                r"(?:sold|sales)\s*[:\-]?\s*([\d,]+)",
+            )),
+            "revenue": _first((
+                r"(?:revenue|earned|grossed|made)\s*(?:[:\-]?\s*)[$€£]?([\d,]+(?:\.\d{1,2})?)",
+                r"[$€£]([\d,]+(?:\.\d{1,2})?)\s*(?:in\s*)?(?:revenue|sales|earned)",
+            )),
+            "reviews": _first((
+                r"([\d,]+)\s*(?:reviews?|ratings?)",
+                r"(?:reviews?|ratings?)\s*[:\-]?\s*([\d,]+)",
+            )),
+            "rating": _first((
+                r"([\d.]+)\s*(?:out of 5|/5|stars?)",
+                r"(?:rated|rating)\s*[:\-]?\s*([\d.]+)",
+            )),
+            "visitors": _first((
+                r"([\d,]+)\s*(?:visitors?|views?|pageviews?|hits?)",
+            )),
+        }
+        found = {k: v for k, v in signals.items() if v not in (None, "")}
+        logger.info(
+            "metrics_fetch_tool: %d signal(s) extracted from %s (%s)",
+            len(found), url, ", ".join(found.keys()) or "none",
+        )
+        return {
+            "status": "SUCCESS",
+            "url": url,
+            "venture_id": venture_id,
+            "signals": signals,
+            "signals_found": found,
+            "note": "Best-effort regex extraction; verify before treating as financial truth.",
+        }
+
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """
         Dispatches dynamic tool execution by name with arguments.
@@ -382,6 +492,12 @@ class Toolbox:
                 url=arguments.get("url", ""),
                 payload=arguments.get("payload", {}),
                 headers=arguments.get("headers"),
+            )
+        elif tool_name == "metrics_fetch_tool":
+            return self.metrics_fetch_tool(
+                url=arguments.get("url", ""),
+                session_cookies=arguments.get("session_cookies"),
+                venture_id=str(arguments.get("venture_id", "") or ""),
             )
         else:
             err = f"Unknown tool requested: '{tool_name}'."
@@ -819,6 +935,18 @@ class AutonomousAgent:
                 dict(entry) for entry in ledger if isinstance(entry, dict)
             ] if isinstance(ledger, list) else []
             logger.info("Hydrated proposals_ledger with %d entr(ies) from previous run.", len(context.proposals_ledger))
+            # Hydrate the persistent venture/portfolio ledger the same way, so the
+            # agent remembers every product it launched and its money to date.
+            ventures = (
+                getattr(saved_state, "ventures_ledger", None)
+                or saved_dict.get("ventures_ledger")
+                or context.payload.get("ventures_ledger")
+                or []
+            )
+            context.ventures_ledger = [
+                dict(entry) for entry in ventures if isinstance(entry, dict)
+            ] if isinstance(ventures, list) else []
+            logger.info("Hydrated ventures_ledger with %d venture(s) from previous run.", len(context.ventures_ledger))
         else:
             logger.info("No prior state found. Bootstrapping initial agent context.")
             context = AgentContext(
@@ -888,10 +1016,14 @@ class AutonomousAgent:
             context_data=ctx.payload,
             session_cookies=getattr(self, "session_cookies", {}) or {},
             proposals_ledger=self.state_manager.proposals_ledger,
+            ventures_ledger=getattr(self.state_manager.context, "ventures_ledger", None)
+            or ctx.payload.get("ventures_ledger", [])
+            or [],
         )
-        # Mirror the ledger into context_data so legacy dashboard builds that read
-        # `context_data` still see every task awaiting the human.
+        # Mirror the ledgers into context_data so legacy dashboard builds that read
+        # `context_data` still see every task awaiting the human and every venture.
         ctx.payload["proposals_ledger"] = self.state_manager.proposals_ledger
+        ctx.payload["ventures_ledger"] = getattr(self.state_manager.context, "ventures_ledger", None) or []
         self.memory.save_short_term_state(self.config.agent_id, snapshot)
 
     def update_session_cookies(self, cookies: Dict[str, str]) -> Dict[str, str]:
@@ -954,7 +1086,24 @@ class AutonomousAgent:
             "It automatically injects any human-provided `session_cookies` from memory as a standard Cookie header, "
             "so you reuse your authenticated session automatically.\n"
             "2. file_writer_tool(filepath: str, content: str): Writes scripts, portfolios, reports, or data files in local workspace.\n"
-            "3. http_poster_tool(url: str, payload: dict, headers: dict = None): Sends POST requests to simulate platform actions or submit data.\n\n"
+            "3. http_poster_tool(url: str, payload: dict, headers: dict = None): Sends POST requests to simulate platform actions or submit data.\n"
+            "4. metrics_fetch_tool(url: str, venture_id: str = ''): Scrapes a public product/listing page for "
+            "commercial signals (units_sold, revenue, reviews, visitors) via best-effort extraction. Use it to "
+            "check how your launched products are performing, then record what you find.\n"
+            "5. venture_tracker_tool(action, ...): YOUR COMMERCIAL MEMORY. Every product, program, listing, or "
+            "micro-business you launch MUST be registered here so its money is tracked across cycles. Actions:\n"
+            "   - register {name, venture_type, platform, url, description, costs}: log a new venture the moment you launch it.\n"
+            "   - record_metric {venture_id, revenue, costs, units_sold, visitors, note}: snapshot its latest money "
+            "(cumulative totals; latest snapshot wins). Use after every metrics_fetch_tool check.\n"
+            "   - list / summary: review the whole portfolio (profitable vs losing vs no-sales).\n"
+            "   - update {venture_id, status, ...}: move ventures through PLANNING/BUILDING/LIVE/MARKETING/PAUSED/RETIRED.\n\n"
+            "VENTURE TRACKING DUTY (MANDATORY): You are an entrepreneur, not a tourist. (a) Every cycle, first call "
+            "venture_tracker_tool summary/list to see your portfolio: which ventures are PROFITABLE (scale them), "
+            "LOSING (fix pricing/costs or retire them), and NO_SALES (market them harder or kill them). "
+            "(b) Register every new product/program you launch the SAME cycle you launch it. "
+            "(c) Re-check LIVE ventures regularly with metrics_fetch_tool on their listing URLs and record_metric "
+            "the results, so you always know who is buying and who is not. This bookkeeping is internal and is "
+            "never blocked by human approval.\n\n"
             "DYNAMIC CONTENT INJECTION (CRITICAL): When you want to save the raw JSON or text results retrieved from a "
             "web browser tool call directly into a workspace file within the same cycle run, you MUST set the `content` "
             "argument of your `file_writer_tool` step to exactly: '[LAST_BROWSER_OUTPUT]'. Never retype, summarise, or "
@@ -1049,6 +1198,113 @@ class AutonomousAgent:
                 calls.append((match.group(1).strip(), {"url": match.group(2).strip()}))
         return calls
 
+    def _venture_tracker_tool(self, **kwargs: Any) -> Dict[str, Any]:
+        """Commercial portfolio ledger: registers ventures and records their money."""
+        ctx = self.state_manager.context
+        # Defensive: older hydrated states may lack the ledger attribute entirely.
+        if not hasattr(ctx, "ventures_ledger") or not isinstance(ctx.ventures_ledger, list):
+            ctx.ventures_ledger = []
+        sm = self.state_manager
+        action = str(kwargs.get("action", "summary") or "summary").lower().strip()
+
+        if action in ("register", "create", "add"):
+            name = str(kwargs.get("name", "") or "").strip()
+            if not name:
+                return {"status": "ERROR", "error": "register requires a `name`."}
+            entry = sm.register_venture({
+                "name": name,
+                "venture_type": str(kwargs.get("venture_type", kwargs.get("type", "other")) or "other"),
+                "description": str(kwargs.get("description", "") or ""),
+                "status": str(kwargs.get("status", "LIVE") or "LIVE"),
+                "platform": str(kwargs.get("platform", "") or ""),
+                "url": str(kwargs.get("url", "") or ""),
+                "currency": str(kwargs.get("currency", "USD") or "USD"),
+                "revenue": kwargs.get("revenue", 0.0),
+                "costs": kwargs.get("costs", kwargs.get("cost", 0.0)),
+                "units_sold": kwargs.get("units_sold", kwargs.get("sales", 0)),
+                "visitors": kwargs.get("visitors", kwargs.get("views", 0)),
+                "notes": str(kwargs.get("notes", kwargs.get("note", "")) or ""),
+            })
+            return {"status": "SUCCESS", "action": "register", "venture": entry}
+
+        if action in ("record", "record_metric", "log", "checkin"):
+            venture_id = str(kwargs.get("venture_id", kwargs.get("id", "")) or "").strip()
+            if not venture_id:
+                return {"status": "ERROR", "error": "record_metric requires a `venture_id`."}
+            entry = sm.record_venture_metric(
+                venture_id,
+                revenue=kwargs.get("revenue"),
+                costs=kwargs.get("costs", kwargs.get("cost")),
+                units_sold=kwargs.get("units_sold", kwargs.get("sales")),
+                visitors=kwargs.get("visitors", kwargs.get("views")),
+                note=str(kwargs.get("note", kwargs.get("notes", "")) or ""),
+            )
+            if entry is None:
+                return {"status": "ERROR", "error": f"venture '{venture_id}' not found."}
+            return {"status": "SUCCESS", "action": "record_metric", "venture": entry}
+
+        return self._venture_tracker_query(action, kwargs)
+
+    def _venture_tracker_query(self, action: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Read-only venture views: get / update / list / summary."""
+        sm = self.state_manager
+
+        if action in ("get", "show", "detail"):
+            venture_id = str(kwargs.get("venture_id", kwargs.get("id", "")) or "").strip()
+            entry = sm.get_venture(venture_id) if venture_id else None
+            if entry is None:
+                return {"status": "ERROR", "error": f"venture '{venture_id}' not found."}
+            return {"status": "SUCCESS", "action": "get", "venture": entry}
+
+        if action in ("update", "set", "edit"):
+            venture_id = str(kwargs.get("venture_id", kwargs.get("id", "")) or "").strip()
+            if not venture_id:
+                return {"status": "ERROR", "error": "update requires a `venture_id`."}
+            allowed = ("name", "venture_type", "description", "status", "platform",
+                        "url", "currency", "revenue", "costs", "units_sold",
+                        "visitors", "notes")
+            updates: Dict[str, Any] = {}
+            for key in allowed:
+                if kwargs.get(key) is not None:
+                    updates[key] = kwargs[key]
+            aliases = (("type", "venture_type"), ("cost", "costs"), ("sales", "units_sold"),
+                        ("views", "visitors"), ("note", "notes"))
+            for alias, real in aliases:
+                if real not in updates and kwargs.get(alias) is not None:
+                    updates[real] = kwargs[alias]
+            entry = sm.update_venture(venture_id, updates)
+            if entry is None:
+                return {"status": "ERROR", "error": f"venture '{venture_id}' not found."}
+            return {"status": "SUCCESS", "action": "update", "venture": entry}
+
+        if action in ("summary", "portfolio", "report"):
+            summary = sm.portfolio_summary()
+            return {"status": "SUCCESS", "action": "summary", "summary": summary,
+                    "ventures": self._compact_ventures()}
+
+        compact = self._compact_ventures()
+        return {"status": "SUCCESS", "action": "list", "ventures": compact, "count": len(compact)}
+
+    def _compact_ventures(self) -> List[Dict[str, Any]]:
+        """Compact per-venture row used by list/summary views."""
+        rows = []
+        for v in self.state_manager.ventures():
+            if not isinstance(v, dict):
+                continue
+            rows.append({
+                "venture_id": v.get("venture_id"),
+                "name": v.get("name"),
+                "status": v.get("status"),
+                "health": v.get("health"),
+                "revenue": v.get("revenue"),
+                "costs": v.get("costs"),
+                "profit": v.get("profit"),
+                "units_sold": v.get("units_sold"),
+                "visitors": v.get("visitors"),
+                "last_checked": v.get("last_checked"),
+            })
+        return rows
+
     def _execute_single_tool_call(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Runs one chained tool link and returns its normalized result record."""
         record: Dict[str, Any] = {
@@ -1069,6 +1325,21 @@ class AutonomousAgent:
                         or None,
                     },
                 )
+            elif tool_name == "metrics_fetch_tool":
+                tool_output = self.toolbox.execute_tool(
+                    tool_name,
+                    {
+                        **args,
+                        "session_cookies": args.get("session_cookies")
+                        or getattr(self, "session_cookies", {})
+                        or None,
+                    },
+                )
+            elif tool_name == "venture_tracker_tool":
+                # State-aware commercial ledger: runs on the agent (owns state),
+                # not the stateless Toolbox. Never gated: it is bookkeeping, not
+                # an external action.
+                tool_output = self._venture_tracker_tool(**args)
             else:
                 tool_output = self.toolbox.execute_tool(tool_name, args)
             record["tool_output"] = tool_output
@@ -1123,17 +1394,39 @@ class AutonomousAgent:
     # Human-in-the-Loop Dashboard Gateway helpers
     # ------------------------------------------------------------------
 
-    # Signals that a task touches external platforms / money / publishing
-    APPROVAL_TRIGGER_PATTERNS = (
-        r"external platform", r"marketplace", r"payment", r"transaction", r"invoice",
+    # Category 1 — identity/account walls. Almost always still gated (the agent
+    # cannot complete these alone); bypassed only in GATE_MODE=full.
+    ACCOUNT_GATE_PATTERNS = (
         r"account creation", r"create an account", r"sign ?up", r"registration",
-        r"register", r"registration link", r"login wall", r"log ?in", r"sign-?in required",
-        r"verify (?:your |email |account|identity)", r"email verification", r"two-?factor",
-        r"github sponsors", r"sponsor profile", r"publish", r"submit (?:a )?(?:proposal|listing|pitch)",
-        r"\bpitch", r"freelance", r"\bsell\b", r"checkout", r"payout", r"escrow",
-        r"\bbid\b", r"human_action_needed", r"human intervention", r"human review",
-        r"bank transfer", r"paypal", r"upload (?:asset|listing)", r"post (?:a )?listing",
-        r"financial transaction", r"needs (?:an? )?(?:account|verification|approval)",
+        r"\bregister\b", r"registration link", r"login wall", r"log ?in",
+        r"sign-?in required", r"verify (?:your |email |account|identity)",
+        r"email verification", r"two-?factor",
+    )
+
+    # Category 2 — real money movement. Gated in strict/balanced, allowed when
+    # ALLOW_MONEY_MOVEMENT=true or GATE_MODE=full.
+    MONEY_GATE_PATTERNS = (
+        r"bank transfer", r"\bpaypal\b", r"\bescrow\b", r"\bwithdraw(?:al)?\b",
+        r"\bdeposit\b", r"wire transfer", r"send money", r"crypto transfer",
+        r"financial transaction",
+    )
+
+    # Category 3 — commercial publishing/selling actions. Gated ONLY in strict
+    # mode; in balanced/full (the default) the agent acts autonomously.
+    SELL_PUBLISH_GATE_PATTERNS = (
+        r"external platform", r"marketplace", r"\bpayment\b", r"\btransaction\b",
+        r"\binvoice\b", r"github sponsors", r"sponsor profile", r"\bpublish\b",
+        r"submit (?:a )?(?:proposal|listing|pitch)", r"\bpitch\b", r"freelance",
+        r"\bsell\b", r"\bcheckout\b", r"\bpayout\b", r"\bbid\b",
+        r"upload (?:asset|listing)", r"post (?:a )?listing",
+        r"needs (?:an? )?(?:account|verification|approval)",
+    )
+
+    # Legacy combined tuple kept for backwards compatibility (tests, dashboard).
+    APPROVAL_TRIGGER_PATTERNS = (
+        ACCOUNT_GATE_PATTERNS + MONEY_GATE_PATTERNS + SELL_PUBLISH_GATE_PATTERNS + (
+            r"human_action_needed", r"human intervention", r"human review",
+        )
     )
 
     _KNOWN_PLATFORMS = (
@@ -1144,14 +1437,62 @@ class AutonomousAgent:
         "ThemeForest",
     )
 
+    def _gate_mode(self) -> str:
+        """Normalized autonomy mode: strict | balanced | full."""
+        mode = str(getattr(self.config, "gate_mode", "balanced") or "balanced").lower()
+        return mode if mode in ("strict", "balanced", "full") else "balanced"
+
+    def _matches_any(self, low: str, patterns: Tuple[str, ...]) -> bool:
+        return any(re.search(pattern, low) for pattern in patterns)
+
     def _requires_human_approval(self, text: str) -> bool:
-        """Detects external-platform / financial / publishing intent in a plan step."""
+        """
+        Decides whether a plan step needs human approval under the autonomy policy.
+
+        Venture/revenue bookkeeping is NEVER gated (it is read-only tracking).
+        In balanced mode the agent may autonomously sell, publish, list, pitch,
+        and submit; only account walls and real money movement still need a human.
+        In full mode nothing is gated. Explicit human_action_needed markers
+        written by tools still gate in strict/balanced so dashboards stay useful.
+        """
         if not text:
             return False
         low = text.lower()
+        mode = self._gate_mode()
+
+        # Internal venture/revenue bookkeeping is read-only tracking — never gate.
+        bookkeeping = (
+            "venture_tracker_tool", "metrics_fetch_tool", "record_metric",
+            "portfolio summary", "ventures_ledger", "record revenue",
+            "record sales",
+        )
+        if any(marker in low for marker in bookkeeping):
+            return False
+
+        if mode == "full":
+            return False
+
+        if self._matches_any(low, self.ACCOUNT_GATE_PATTERNS):
+            return True
+        if self._matches_any(low, self.MONEY_GATE_PATTERNS):
+            if getattr(self.config, "allow_money_movement", None) is True:
+                return False
+            return True
+        if self._matches_any(low, self.SELL_PUBLISH_GATE_PATTERNS):
+            if mode == "strict":
+                return True
+            if getattr(self.config, "allow_selling", None) is False:
+                return True
+            if getattr(self.config, "allow_publishing", None) is False:
+                publication = re.search(
+                    r"\bpublish\b|upload (?:asset|listing)|post (?:a )?listing|"
+                    r"submit (?:a )?(?:proposal|listing|pitch)", low)
+                if publication:
+                    return True
+            return False
         if "human_action_needed" in low or "human intervention" in low:
             return True
-        return any(re.search(pattern, low) for pattern in self.APPROVAL_TRIGGER_PATTERNS)
+        return False
 
     def _classify_proposal_type(self, text: str) -> str:
         low = text.lower()
@@ -1460,6 +1801,44 @@ class AutonomousAgent:
                 return entry
         return None
 
+    def _portfolio_brief(self) -> Dict[str, Any]:
+        """
+        Compact portfolio snapshot injected into every PLAN prompt.
+
+        Lets the agent see its ventures and money each cycle — which ones are
+        PROFITABLE (scale them), LOSING (fix or retire them), and NO_SALES
+        (market them or kill them). Returns a serializable brief; never raises.
+        """
+        try:
+            summary = self.state_manager.portfolio_summary()
+        except Exception as exc:
+            logger.warning("Portfolio brief unavailable: %s", exc)
+            return {"total_ventures": 0, "note": "portfolio unavailable"}
+        brief = dict(summary)
+        # Attach per-venture one-liners so the planner can name targets.
+        rows = []
+        for v in self.state_manager.ventures():
+            if not isinstance(v, dict):
+                continue
+            rows.append({
+                "venture_id": v.get("venture_id"),
+                "name": v.get("name"),
+                "status": v.get("status"),
+                "health": v.get("health"),
+                "revenue": v.get("revenue"),
+                "costs": v.get("costs"),
+                "profit": v.get("profit"),
+                "units_sold": v.get("units_sold"),
+                "visitors": v.get("visitors"),
+                "url": v.get("url", ""),
+            })
+        brief["ventures"] = rows
+        if not rows:
+            brief["note"] = ("No ventures tracked yet. Register every product/program "
+                             "you launch with venture_tracker_tool so its money is tracked.")
+        return brief
+
+
     def _register_gate(self, source_text: str, phase: str) -> Optional[Dict[str, Any]]:
         """
         Non-blocking gate registration with deduplication.
@@ -1609,11 +1988,13 @@ class AutonomousAgent:
                     if self.session_cookies else "No session cookies provided."
                 )
                 ledger_hint = json.dumps(self.state_manager.ledger_summary())
+                portfolio_hint = json.dumps(self._portfolio_brief())
                 plan_prompt = (
                     f"Agent ID: {self.config.agent_id}\n"
                     f"Current Cycle: {ctx.cycle_count}\n"
                     f"Recent Logs: {json.dumps(log_summaries)}\n"
                     f"Proposals Ledger Status: {ledger_hint}\n"
+                    f"Portfolio (your ventures + money): {portfolio_hint}\n"
                     f"{session_hint}\n"
                     "Task: A human-approved task chain has just been executed. Continue exploring new "
                     "opportunities and formulate the next atomic operational plan "
@@ -1633,11 +2014,13 @@ class AutonomousAgent:
                     if self.session_cookies else "No session cookies provided."
                 )
                 ledger_hint = json.dumps(self.state_manager.ledger_summary())
+                portfolio_hint = json.dumps(self._portfolio_brief())
                 plan_prompt = (
                     f"Agent ID: {self.config.agent_id}\n"
                     f"Current Cycle: {ctx.cycle_count}\n"
                     f"Recent Logs: {json.dumps(log_summaries)}\n"
                     f"Proposals Ledger Status: {ledger_hint}\n"
+                    f"Portfolio (your ventures + money): {portfolio_hint}\n"
                     f"{session_hint}\n"
                     "Task: Synthesize context and formulate an atomic operational plan "
                     "(up to 5 chained TOOL_CALL steps)."
